@@ -265,7 +265,13 @@ class PositionManager:
                 age_hours = (to_utc(now) - to_utc(opened_at)).total_seconds() / 3600.0
             except Exception:  # noqa: BLE001
                 age_hours = 0.0
-            if age_hours >= max_age_hours:
+            let_winner_run = False
+            if self.settings.risk.time_exit_only_losers and age_hours < max_age_hours * 2.0:
+                try:
+                    let_winner_run = position.unrealized_pnl(market_price) > 0
+                except Exception:  # noqa: BLE001
+                    let_winner_run = False
+            if age_hours >= max_age_hours and not let_winner_run:
                 pnl = await self._safe_close(position, market_price, "TIME_EXIT")
                 total = round(state.realized + pnl, 2)
                 self._notify_closed(position, total, "TIME_EXIT")
@@ -313,6 +319,7 @@ class PositionManager:
                             tp2_hit=False,
                             pip_size=self.settings.risk.pip_size,
                             buffer_pips=self.settings.risk.trailing_breakeven_buffer_pips,
+                            breakeven_after_tp1=self.settings.risk.breakeven_after_tp1,
                         )
                         if trail is not None:
                             await self._apply_stop(position, trail.stop_loss, trail.reason)

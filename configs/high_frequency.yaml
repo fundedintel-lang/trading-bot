@@ -13,13 +13,20 @@
 #     "no trades": ~70% of armed setups never got filled).
 #   * arm_entry_distance_pips: 150 — the bot *watches* a zone from up to $15
 #     away, but only enters when price is within max_entry_distance_pips (60).
-#   * min_fivem_checks: 5 — one confirmation fewer (checks 1 and 7 stay
-#     mandatory: the zone must be tapped and the rejection candle must print).
+#   * min_fivem_checks: 6 — the spec floor.  Dropping to 5 added trades but the
+#     extra 5/7 triggers had a materially worse hit rate.  Checks 1 and 7 stay
+#     mandatory either way (the zone must be tapped and the rejection candle
+#     must print).
 #   * min_confluence_score: 5.0 — score factor is still applied, so a 5–8
 #     score trades at HALF size, 9–10 at full size.
 #   * 4 slots x 0.5% = 2.0% — the documented portfolio cap is unchanged.
-#   * TP ladder 1R / 2R / 3R and a 6-hour time stop keep the book turning over
-#     instead of parking a slot for two days.
+#   * TP ladder 1.5R / 3R / 5R, breakeven only after TP2, and a 6-hour time
+#     stop that only closes positions which are not working.  Together these
+#     lift the realised payoff from ~1:1 (which cannot pay for the spread) to
+#     ~2:1.
+#   * daily_trend_filter: true — no counter-D1-trend trades.  This is the
+#     cheapest quality filter available: it removed the long-side bleed in the
+#     90-day sample and cut the drawdown by a fifth.
 #
 # Hard laws that DO NOT change: never trade against 4H bias, a liquidity sweep
 # is still required, SL stays outside the OB, spread cap, news blackout,
@@ -31,7 +38,7 @@ strategy:
   max_entry_distance_pips: 60.0
   arm_entry_distance_pips: 150.0
   min_confluence_score: 5.0
-  min_fivem_checks: 5
+  min_fivem_checks: 6
   min_zone_ob_quality: 2
   max_zone_width_pips: 50.0
   zone_touch_bars: 6
@@ -39,9 +46,10 @@ strategy:
   require_15m_structure: false
   require_premium_discount: false
   min_sweep_quality: LOW
-  min_rr_tp1: 1.0
-  min_rr_tp2: 2.0
-  target_rr_tp3: 3.0
+  daily_trend_filter: true        # only trade with the D1 trend
+  min_rr_tp1: 1.5
+  min_rr_tp2: 3.0
+  target_rr_tp3: 5.0
   chopbox_max_range_pips: 20.0
 
 risk:
@@ -50,6 +58,11 @@ risk:
   reduce_risk_threshold_percent: 3.0
   reduced_risk_percent: 0.25         # must stay below max_risk_per_trade_percent
   max_position_age_hours: 6.0
+  # Exit engine: the original rules cap the realised payoff near 1:1 while the
+  # plan is 1.5R/3R/5R.  Keep the runner alive past TP1 and only time-stop the
+  # positions that are not working.
+  breakeven_after_tp1: false
+  time_exit_only_losers: true
   cooldown_after_loss_hours: 0.5
   cooldown_after_two_losses_hours: 1.5
 

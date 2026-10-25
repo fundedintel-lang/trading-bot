@@ -33,7 +33,7 @@ from apex_smc_bot.analysis.liquidity import build_liquidity_map, detect_induceme
 from apex_smc_bot.analysis.order_blocks import detect_order_blocks
 from apex_smc_bot.analysis.premium_discount import dealing_range_from_structure
 from apex_smc_bot.analysis.session import Session, SessionEngine, detect_judas_swing
-from apex_smc_bot.analysis.structure import analyze_structure
+from apex_smc_bot.analysis.structure import BEARISH, BULLISH, analyze_structure
 from apex_smc_bot.config import Settings
 from apex_smc_bot.core.state_manager import StateManager
 from apex_smc_bot.data.candle_manager import (
@@ -519,6 +519,12 @@ class TradingEngine:
             four_h = self.htf.analyze(h4, "H4", current_price=price)
             one_h = self.htf.analyze_1h(h1, current_price=price, four_h=four_h)
             alignment = self.htf.check_alignment(four_h, one_h)
+            if self.settings.strategy.daily_trend_filter and alignment.aligned:
+                daily = self.htf.daily_trend(h4)
+                if daily in {BULLISH, BEARISH} and daily != alignment.direction:
+                    report.rejections.append("D1_TREND_CONFLICT")
+                    self.state.note_rejection()
+                    return alignment, structure, order_blocks
             # Built *after* the bias so sweeps are graded against the direction
             # actually being traded (bias=None can only ever yield HIGH/LOW).
             liquidity = build_liquidity_map(

@@ -113,8 +113,14 @@ def next_stop(
     pip_size: float = 0.10,
     buffer_pips: float = 1.0,
     atr_multiplier: float = 2.0,
+    breakeven_after_tp1: bool = True,
 ) -> TrailPlan | None:
     """Compute the next improved stop, or ``None`` when it must not move.
+
+    Args:
+        breakeven_after_tp1: When False the stop is left untouched after TP1 and
+            only protected once TP2 fills.  The runner keeps its original risk,
+            which is what makes the 3R/5R targets reachable.
 
     The returned stop is guaranteed to be on the protective side of the current
     market price and strictly better than ``current_stop``.
@@ -126,13 +132,14 @@ def next_stop(
     candidates: list[tuple[float, str, str]] = []
 
     if not tp2_hit:
-        candidates.append(
-            (
-                breakeven_stop(entry, direction, pip_size, buffer_pips),
-                "BREAKEVEN",
-                "TP1 hit — stop to breakeven",
+        if breakeven_after_tp1:
+            candidates.append(
+                (
+                    breakeven_stop(entry, direction, pip_size, buffer_pips),
+                    "BREAKEVEN",
+                    "TP1 hit — stop to breakeven",
+                )
             )
-        )
     else:
         candidates.append(
             (

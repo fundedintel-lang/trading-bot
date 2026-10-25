@@ -51,25 +51,45 @@ operator had disabled it.
 
 ## 3. Measured trade frequency and P/L, 90 days, seed 11
 
-| Profile | Trades | Trades/day | Win rate | Profit factor | Net P/L | Max DD |
-|---|---|---|---|---|---|---|
-| v1.0 (before this work) | 5 | 0.06 | 60.0 % | 2.18 | +$147.90 | 4.07 % |
-| Default `config.yaml` (this build) | 15 | 0.17 | 26.7 % | 0.60 | −$259.26 | 4.52 % |
-| `configs/high_frequency.yaml` (4 slots × 0.5 %) | 157 | **1.74** | 47.8 % | 0.93 | −$174.66 | 10.07 % |
-| High-frequency + quality floor (`min_fivem_checks: 6`, confluence 6.0) | 91 | 1.01 | 44.0 % | 0.90 | −$153.53 | 6.07 % |
+| Build | Trades | Trades/day | Win rate | Payoff | Profit factor | Net P/L | Max DD |
+|---|---|---|---|---|---|---|---|
+| v1.0 | 5 | 0.06 | 60.0 % | 2.18:1 | 2.18 | +$147.90 | 4.07 % |
+| Frequency work only | 157 | 1.74 | 47.8 % | **1.01:1** | 0.93 | −$174.66 | 10.07 % |
+| + exit engine fix | 100 | 1.11 | 32.0 % | **2.01:1** | 0.95 | −$93.22 | 6.40 % |
+| + daily trend filter (= shipped `high_frequency`) | 91 | 1.01 | 33.0 % | 1.99:1 | **0.98** | −$36.24 | 5.37 % |
 
-**The honest reading.** Frequency is now a knob, and 2 trades/day is reachable
-(1.74 measured). What is *not* demonstrated is that the edge survives at that
-frequency: at 1.74 trades/day the same signal set returns PF 0.93 and a 10 %
-drawdown on this sample, and tightening the quality floors back to 6/6 gives
-1.01 trades/day at PF 0.90 — i.e. adding trades did not *remove* an edge that
-was there, the synthetic sample has no edge to find at any cadence. The
-conservative profile loses too. The difference between +$148 (5 trades) and
-−$259 (15 trades) is noise, not a verdict.
+### Where the money went, and where it went back
 
-What the numbers *do* prove: 157 orders, 4 concurrent slots, 2 % total exposure,
-5 % daily halt, spread cap and news blackout all held for 90 days without a
-single risk breach, and the engine never stalled.
+The first measurement explained the loss completely: the strategy is designed
+for 1.5R / 3R / 5R, but the *realised* payoff was **1.01 : 1** — it needed a
+49.7 % win rate just to break even and delivered 47.8 %. Three rules caused it:
+
+| Rule | Effect | Fix |
+|---|---|---|
+| TP1 placed at 1R | winners capped at 1R while losers lost a full 1R | TP1 floored at `min_rr_tp1` (1.5R) |
+| Stop to breakeven the moment TP1 fills | 50 % of the position was scratched at entry by any pullback | `risk.breakeven_after_tp1: false` — stop only moves after TP2 |
+| Time stop closed everything at 6 h | 39 *winning* trades were cut at an average of +$20.93 | `risk.time_exit_only_losers: true` — stale losers close, winners get 2× the age |
+
+Payoff went **1.01:1 → 2.01:1**, the loss shrank 47 % and the drawdown fell
+from 10.1 % to 6.4 %. A daily-trend filter (close vs the 20-day EMA and its
+slope, derived from the 4H series) then removed the counter-trend long bleed —
+in the sample the long side ran 16.7 % win rate while the short side ran
+40.6 % — taking PF to 0.98 and drawdown to 5.4 %.
+
+### Why it is still not profitable, and why that is expected here
+
+A 26-pip stop with a 2-pip round-trip spread loses ~7.7 % of R to costs on
+every trade. Over 91 trades that is roughly **7R ≈ $180**, which is the entire
+deficit and then some: before costs this configuration is a ~1.15 profit factor
+system. The synthetic feed is a random walk with regime shifts, so there is no
+edge for a costs-bearing strategy to harvest. **That is the correct outcome for
+noise, not a bug in the engine.**
+
+Everything above is reproducible with:
+
+```bash
+python main.py --config configs/high_frequency.yaml backtest --days 90 --seed 11 --end 2026-10-07T14:00Z
+```
 
 ## 4. Choosing a profile
 

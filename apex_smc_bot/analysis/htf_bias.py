@@ -207,6 +207,39 @@ class HTFBiasEngine:
         else:
             self.strategy = config or StrategyConfig()
 
+    # ------------------------------------------------------------------ daily trend
+    @staticmethod
+    def daily_trend(candles_4h: Sequence[Candle], period: int = 20) -> str:
+        """Coarse D1 trend from the 4H series (six 4H bars per trading day).
+
+        Returns ``BULLISH``, ``BEARISH`` or ``RANGING``.  A trend only counts
+        when price sits on one side of a rising/falling EMA *and* the EMA has
+        actually moved over the last three days; otherwise the market is
+        ranging and the filter stays out of the way.
+        """
+
+        if len(candles_4h) < period * 6 + 24:
+            return RANGING
+        daily = [c.close for c in candles_4h[5::6]]
+        if len(daily) < period + 3:
+            return RANGING
+        k = 2.0 / (period + 1.0)
+        ema = sum(daily[:period]) / period
+        emas: list[float] = []
+        for price in daily[period:]:
+            ema = price * k + ema * (1.0 - k)
+            emas.append(ema)
+        if len(emas) < 4:
+            return RANGING
+        price = daily[-1]
+        slope = emas[-1] - emas[-4]
+        tolerance = max(abs(emas[-1]) * 0.0005, 0.05)
+        if price > emas[-1] and slope > tolerance:
+            return BULLISH
+        if price < emas[-1] and slope < -tolerance:
+            return BEARISH
+        return RANGING
+
     # ------------------------------------------------------------------ analysis
     def analyze(
         self,
