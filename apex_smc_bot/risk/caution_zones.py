@@ -165,7 +165,11 @@ def evaluate_caution_zones(
         result.notes.append("Price is too far from the entry zone — do not chase")
 
     # 8) Structure conflict at execution time
-    if structure is not None and structure.direction not in {pending.direction, "RANGING"}:
+    if (
+        strategy.require_15m_structure
+        and structure is not None
+        and structure.direction not in {pending.direction, "RANGING"}
+    ):
         result.flags.append("15M_STRUCTURE_FLIPPED")
         result.abort = True
         result.notes.append("15M structure flipped against the setup while pending")

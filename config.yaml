@@ -82,7 +82,9 @@ strategy:
   ob_freshness_hours: 48.0
   fvg_freshness_hours: 24.0
   sweep_lookahead_candles: 16
+  single_swing_lookback_bars: 96    # previous swing highs/lows are raidable pools too
   inducement_lookback_candles: 12
+  min_zone_ob_quality: 3           # OB grading needed before a block becomes an entry zone
   min_zone_width_pips: 4.0         # skip micro OB/FVG bands (< $0.40 on gold)
   max_zone_width_pips: 30.0        # wider "zones" are structure, not entries
   tp1_close_fraction: 0.5           # close 50 % at TP1
@@ -93,7 +95,16 @@ strategy:
   min_obstacle_quality: 3           # weak (<3) opposing blocks are noise on gold
   zone_touch_bars: 3                # an OB/FVG stays "in play" for N five-minute bars
   chopbox_lookback: 10
-  chopbox_max_range_pips: 20.0
+  chopbox_max_range_pips: 35.0      # 10-bar 15M range below this is chop
+  # ---- selectivity / frequency -------------------------------------------
+  allow_range_alignment: true       # 4H ranging → follow the 1H from the correct range half
+  allow_15m_ranging: true           # a ranging 15M is "no structure", not a conflict
+  require_15m_structure: true       # set false to trade 15M counter-structure in a strong HTF trend
+  require_premium_discount: true    # only buy discount / sell premium of the 15M range
+  arm_entry_distance_pips: 0.0      # 0 = same as max_entry_distance_pips
+  structure_event_window_bars: 36   # a 15M event in-direction counts this far back
+  require_sweep_confirmation: false # accept a raid that has not printed its BOS yet
+  min_sweep_quality: MEDIUM         # HIGH | MEDIUM | LOW
 
 # ----------------------------------------------------------------------------
 # Sessions (UTC).  Entries are only allowed inside kill zones.

@@ -256,6 +256,35 @@ class PositionManager:
             )
             return events
 
+        # 1b) Time stop — a position that has not resolved is dead weight: it
+        #     holds a portfolio slot and exposes the book to overnight gaps.
+        max_age_hours = float(self.settings.risk.max_position_age_hours)
+        opened_at = getattr(position, "opened_at", None)
+        if max_age_hours > 0 and opened_at is not None:
+            try:
+                age_hours = (to_utc(now) - to_utc(opened_at)).total_seconds() / 3600.0
+            except Exception:  # noqa: BLE001
+                age_hours = 0.0
+            if age_hours >= max_age_hours:
+                pnl = await self._safe_close(position, market_price, "TIME_EXIT")
+                total = round(state.realized + pnl, 2)
+                self._notify_closed(position, total, "TIME_EXIT")
+                self._state.pop(position.trade_id, None)
+                events.append(
+                    PositionEvent(
+                        "TIME_EXIT",
+                        position.trade_id,
+                        position.signal_id,
+                        market_price,
+                        position.initial_units,
+                        pnl,
+                        f"Time stop after {age_hours:.1f}h ({total:+.2f} total)",
+                        now,
+                        {"total_pnl": total, "age_hours": round(age_hours, 2)},
+                    )
+                )
+                return events
+
         # 2) TP1 — close 50 %, move to breakeven.
         if tp1 is not None and not state.tp1_hit:
             reached = market_price >= tp1 if bullish else market_price <= tp1

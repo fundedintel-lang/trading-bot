@@ -17,7 +17,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from apex_smc_bot.analysis.structure import BEARISH
+from apex_smc_bot.analysis.structure import BEARISH, BULLISH
 from apex_smc_bot.data.candle_manager import to_utc, utcnow
 from apex_smc_bot.execution.broker import (
     AccountSnapshot,
@@ -182,11 +182,15 @@ class PaperBroker:
                 signal_id=request.signal_id,
             )
         trade_id = self._next_trade_id()
+        # Normalise broker vocabulary: the position manager compares against
+        # BULLISH/BEARISH, so a "LONG"/"BUY" request must not silently become a
+        # short in the stop/target logic.
+        direction = BEARISH if str(request.direction).upper() in {"BEARISH", "SHORT", "SELL"} else BULLISH
         position = Position(
             trade_id=trade_id,
             signal_id=request.signal_id,
             instrument=request.instrument,
-            direction=request.direction,
+            direction=direction,
             units=float(request.units),
             initial_units=float(request.units),
             entry_price=fill_price,
@@ -240,7 +244,7 @@ class PaperBroker:
             if request.expires_at is not None and to_utc(request.expires_at) < now:
                 self._pending.pop(order_id, None)
                 continue
-            is_long = request.direction != BEARISH
+            is_long = str(request.direction).upper() not in {"BEARISH", "SHORT", "SELL"}
             reached = mid_price <= request.entry_price if is_long else mid_price >= request.entry_price
             if reached:
                 result = self._fill(request, request.entry_price, self._last_spread, is_long, limit=True)

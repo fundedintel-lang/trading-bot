@@ -1,0 +1,60 @@
+# =============================================================================
+# APEX-SMC — HIGH-FREQUENCY INTRADAY PRESET
+# =============================================================================
+# Use this preset when the goal is trade *flow* (multiple trades per session)
+# rather than the conservative A+ swing profile in config.yaml.
+#
+#   python main.py --config configs/high_frequency.yaml backtest --days 90
+#   python main.py --config configs/high_frequency.yaml run
+#
+# What changes vs the conservative profile and why:
+#   * entry_mode: MARKET  — enters at the 5M trigger instead of resting a limit
+#     order at the zone edge (limit fills were the single biggest source of
+#     "no trades": ~70% of armed setups never got filled).
+#   * arm_entry_distance_pips: 150 — the bot *watches* a zone from up to $15
+#     away, but only enters when price is within max_entry_distance_pips (60).
+#   * min_fivem_checks: 5 — one confirmation fewer (checks 1 and 7 stay
+#     mandatory: the zone must be tapped and the rejection candle must print).
+#   * min_confluence_score: 5.0 — score factor is still applied, so a 5–8
+#     score trades at HALF size, 9–10 at full size.
+#   * 4 slots x 0.5% = 2.0% — the documented portfolio cap is unchanged.
+#   * TP ladder 1R / 2R / 3R and a 6-hour time stop keep the book turning over
+#     instead of parking a slot for two days.
+#
+# Hard laws that DO NOT change: never trade against 4H bias, a liquidity sweep
+# is still required, SL stays outside the OB, spread cap, news blackout,
+# 5% daily circuit breaker, max 2% total exposure.
+# =============================================================================
+
+strategy:
+  entry_mode: MARKET
+  max_entry_distance_pips: 60.0
+  arm_entry_distance_pips: 150.0
+  min_confluence_score: 5.0
+  min_fivem_checks: 5
+  min_zone_ob_quality: 2
+  max_zone_width_pips: 50.0
+  zone_touch_bars: 6
+  structure_event_window_bars: 96
+  require_15m_structure: false
+  require_premium_discount: false
+  min_sweep_quality: LOW
+  min_rr_tp1: 1.0
+  min_rr_tp2: 2.0
+  target_rr_tp3: 3.0
+  chopbox_max_range_pips: 20.0
+
+risk:
+  max_open_trades: 4
+  max_risk_per_trade_percent: 0.5   # 4 x 0.5% = 2.0% portfolio cap
+  reduce_risk_threshold_percent: 3.0
+  reduced_risk_percent: 0.25         # must stay below max_risk_per_trade_percent
+  max_position_age_hours: 6.0
+  cooldown_after_loss_hours: 0.5
+  cooldown_after_two_losses_hours: 1.5
+
+sessions:
+  london_kill_zone_start: "06:00"
+  london_kill_zone_end: "12:00"
+  ny_kill_zone_start: "12:00"
+  ny_kill_zone_end: "17:00"

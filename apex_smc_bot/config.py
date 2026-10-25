@@ -88,6 +88,16 @@ class RiskConfig:
     trailing_breakeven_buffer_pips: float = 1.0
     max_position_age_hours: float = 48.0
 
+    def __post_init__(self) -> None:
+        if self.max_open_trades < 1:
+            raise ConfigError("risk.max_open_trades must be at least 1")
+        exposure = self.max_open_trades * self.max_risk_per_trade_percent
+        if exposure > 2.0 + 1e-9:
+            raise ConfigError(
+                "risk.max_open_trades x risk.max_risk_per_trade_percent must stay "
+                f"within the 2% portfolio cap (got {exposure:.2f}%)"
+            )
+
 
 @dataclass(frozen=True)
 class StrategyConfig:
@@ -109,7 +119,11 @@ class StrategyConfig:
     ob_freshness_hours: float = 48.0
     fvg_freshness_hours: float = 24.0
     sweep_lookahead_candles: int = 16
+    # Individual swings within this many bars are raidable liquidity pools in
+    # addition to equal-high/low clusters (0 disables the classic swing raid).
+    single_swing_lookback_bars: int = 96
     inducement_lookback_candles: int = 12
+    min_zone_ob_quality: int = 3        # order blocks below this are not entry zones
     min_zone_width_pips: float = 4.0
     max_zone_width_pips: float = 30.0
     tp1_close_fraction: float = 0.50
@@ -117,12 +131,62 @@ class StrategyConfig:
     # Maximum distance (pips) between live price and a pending limit entry.
     # Beyond this the zone is stale and the pending setup is discarded.
     max_entry_distance_pips: float = 60.0
+    # Arming radius.  0 = same as max_entry_distance_pips.  A wider arming
+    # radius lets the bot *watch* a zone from further away while the 5M trigger
+    # still enforces "price is at the zone" before an order is sent.
+    arm_entry_distance_pips: float = 0.0
     opposing_ob_warning_pips: float = 25.0
     opposing_ob_abort_pips: float = 40.0
     min_obstacle_quality: int = 3     # ignore weak opposing blocks when checking the path
     zone_touch_bars: int = 3          # an entry zone counts as "live" for N bars after the touch
     chopbox_lookback: int = 10
-    chopbox_max_range_pips: float = 20.0
+    # A 10-bar 15M range narrower than this is chop.  $2.00 was too tight for
+    # gold's normal intraday noise and vetoed most valid setups.
+    chopbox_max_range_pips: float = 35.0
+
+    # ---- selectivity / frequency controls --------------------------------
+    # When the 4H is ranging there is no HTF bias to trade against, so a setup
+    # may follow the 1H instead — but only from the correct half of the 4H
+    # dealing range (buy the discount, sell the premium).  This is range
+    # trading, never counter-trend trading.
+    # The 4H is the law ("never trade against 4H bias"), but the 1H does not
+    # have to agree: a 1H pullback *inside* a 4H trend is the classic discount
+    # entry.  When False only fully aligned 4H+1H setups may arm.
+    allow_1h_pullback_alignment: bool = True
+    allow_range_alignment: bool = True
+    # A ranging 15M is "no structure", not "conflicting structure": the sweep,
+    # the zone and the HTF bias already carry the edge.
+    allow_15m_ranging: bool = True
+    # A 15M structure pointing the other way rejects the setup.  Strong-trend
+    # profiles may keep it on; higher-frequency profiles turn it off and let
+    # the sweep + zone + 5M trigger carry the decision.
+    require_15m_structure: bool = True
+    # Only buy the discount / sell the premium of the 15M dealing range.
+    require_premium_discount: bool = True
+    # A 15M event in the trade direction counts as structure this many bars back.
+    structure_event_window_bars: int = 36
+    # Accept a raid that has not yet produced its BOS.  The sweep still has to
+    # exist (a raid beyond an equal high/low that closed back inside).
+    require_sweep_confirmation: bool = False
+    min_sweep_quality: str = "MEDIUM"  # HIGH | MEDIUM | LOW
+    # LIMIT  — rest at the zone edge and wait for the pullback (highest R:R,
+    #          lowest fill rate: most zones are never revisited inside the
+    #          signal lifetime).
+    # MARKET — enter at the 5M trigger price once price is already inside the
+    #          confirmed entry window (fills immediately, same structural stop).
+    entry_mode: str = "LIMIT"
+
+    def __post_init__(self) -> None:
+        mode = str(self.entry_mode).upper()
+        if mode not in {"LIMIT", "MARKET"}:
+            raise ConfigError(f"strategy.entry_mode must be LIMIT or MARKET, got {self.entry_mode!r}")
+        object.__setattr__(self, "entry_mode", mode)
+        quality = str(self.min_sweep_quality).upper()
+        if quality not in {"HIGH", "MEDIUM", "LOW"}:
+            raise ConfigError(
+                f"strategy.min_sweep_quality must be HIGH, MEDIUM or LOW, got {self.min_sweep_quality!r}"
+            )
+        object.__setattr__(self, "min_sweep_quality", quality)
 
 
 @dataclass(frozen=True)
@@ -135,6 +199,11 @@ class SessionConfig:
     ny_close_end: time = time(20, 0)
     judas_window_minutes: int = 30
     allow_outside_kill_zone: bool = False
+    # Kill zones are the highest-quality window, but the London afternoon
+    # (10:00-12:00) and the London close / NY afternoon (15:00-17:00) are liquid
+    # sessions where reversal setups also print.  When True, any session marked
+    # tradeable may arm; dead zones and the Judas window stay blocked.
+    trade_secondary_sessions: bool = True
 
     def __post_init__(self) -> None:
         for start, end, label in (

@@ -237,6 +237,29 @@ def detect_equal_levels(
     )
 
 
+def single_swing_levels(swings: Sequence[SwingPoint], internal: bool = True) -> list[EqualLevel]:
+    """Turn individual swing points into one-swing liquidity pools.
+
+    Equal high/low clusters are the strongest pools, but they are also rare on
+    gold: a 5-pip tolerance is only $0.50, far tighter than a 15M candle.  The
+    classic ICT raid targets the *previous swing high/low*, so single swings
+    must be raidable too or the sweep filter rejects almost every setup.
+    """
+
+    levels: list[EqualLevel] = []
+    for swing in swings:
+        levels.append(
+            EqualLevel(
+                kind=EQH if swing.is_high else EQL,
+                price=swing.price,
+                swings=(swing,),
+                tolerance=0.0,
+                internal=internal,
+            )
+        )
+    return levels
+
+
 def detect_liquidity_levels(
     candles: Sequence[Candle], tolerance_pips: float = 5.0, lookback: int = 3, pip_size: float = 0.10
 ) -> tuple[list[EqualLevel], list[EqualLevel]]:
@@ -403,15 +426,42 @@ def build_liquidity_map(
     bias: str | None = None,
     lookahead: int = 16,
     pip_size: float = 0.10,
+    single_swing_lookback: int = 0,
 ) -> LiquidityMap:
-    """Build internal + external liquidity maps with sweep confirmation."""
+    """Build internal + external liquidity maps with sweep confirmation.
+
+    Args:
+        candles: Closed candles, oldest first.
+        timeframe: Label for the map ("M15").
+        tolerance_pips: Equal-high/low clustering tolerance in pips.
+        internal_lookback: Swing lookback for internal structure.
+        external_lookback: Swing lookback for external structure.
+        bias: Direction being traded; grades sweep quality.
+        lookahead: Bars allowed for the confirming BOS after a raid.
+        pip_size: Instrument pip size ($0.10 on XAUUSD).
+        single_swing_lookback: When > 0, swings from the last N bars are also
+            raidable liquidity pools (the classic previous-swing-high/low raid).
+    """
 
     dual = analyze_dual_structure(candles, timeframe, internal_lookback, external_lookback)
     internal = dual["internal"]
     external = dual["external"]
     eqh_i, eql_i = detect_equal_levels(internal.swings, tolerance_pips, pip_size, internal=True)
     eqh_e, eql_e = detect_equal_levels(external.swings, tolerance_pips, pip_size, internal=False)
-    sweeps = detect_sweeps(candles, eqh_i + eql_i, internal.events, bias=bias, lookahead=lookahead)
+    pool_levels = eqh_i + eql_i
+    if single_swing_lookback > 0:
+        floor = len(candles) - single_swing_lookback
+        pool_levels = (
+            pool_levels
+            + single_swing_levels([s for s in external.swings if s.index >= floor], internal=False)
+            + single_swing_levels([s for s in internal.swings if s.index >= floor], internal=True)
+        )
+    sweeps = detect_sweeps(candles, pool_levels, internal.events, bias=bias, lookahead=lookahead)
+    if single_swing_lookback > 0 and external.events is not internal.events:
+        sweeps = sorted(
+            sweeps + detect_sweeps(candles, eqh_e + eql_e, external.events, bias=bias, lookahead=lookahead),
+            key=lambda sweep: sweep.index,
+        )
     return LiquidityMap(
         timeframe=timeframe,
         internal_levels=eqh_i + eql_i,

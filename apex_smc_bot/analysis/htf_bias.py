@@ -139,6 +139,10 @@ class AlignmentResult:
     direction: str
     strength: str
     action: str
+    # FULL       — 4H and 1H point the same way
+    # 4H_PULLBACK— 4H trend intact, 1H is pulling back against it (entry, not reversal)
+    # RANGE      — 4H ranging, 1H direction traded from the correct range half
+    mode: str = "FULL"
     monitor: str = ""
     confluent_zones: list[ConfluentZone] = field(default_factory=list)
     four_h: HTFBias | None = None
@@ -148,6 +152,7 @@ class AlignmentResult:
         return {
             "aligned": self.aligned,
             "direction": self.direction,
+            "mode": self.mode,
             "strength": self.strength,
             "action": self.action,
             "monitor": self.monitor,
@@ -156,7 +161,7 @@ class AlignmentResult:
 
     def describe(self) -> str:
         if self.aligned:
-            return f"HTF aligned {self.direction} ({self.strength}) — {self.action}"
+            return f"HTF aligned {self.direction} ({self.strength}, {self.mode}) — {self.action}"
         return f"HTF conflict ({self.direction}) — {self.action}"
 
 
@@ -261,6 +266,7 @@ class HTFBiasEngine:
             external_lookback=strategy.external_swing_lookback,
             bias=direction if direction in {BULLISH, BEARISH} else None,
             lookahead=strategy.sweep_lookahead_candles,
+            single_swing_lookback=strategy.single_swing_lookback_bars,
         )
         dealing_range = dealing_range_from_structure(
             external, strategy.ote_low_fib, strategy.ote_high_fib
@@ -302,7 +308,14 @@ class HTFBiasEngine:
 
     # ------------------------------------------------------------------ alignment
     def check_alignment(self, four_h: HTFBias, one_h: HTFBias) -> AlignmentResult:
-        """Hard gate: both HTFs must agree, otherwise no execution."""
+        """Hard gate: both HTFs must agree, otherwise no execution.
+
+        One documented exception: when the 4H is **ranging** there is no HTF
+        bias to violate, so the 1H direction may be traded — but only from the
+        correct half of the 4H dealing range (discount for longs, premium for
+        shorts).  That is range trading at a range edge, not counter-trend
+        trading; a 4H that leans the opposite way always blocks.
+        """
 
         zones = self.find_confluent_zones(four_h, one_h)
         if four_h.direction == one_h.direction and four_h.direction in {BULLISH, BEARISH}:
@@ -310,8 +323,36 @@ class HTFBiasEngine:
             return AlignmentResult(
                 aligned=True,
                 direction=four_h.direction,
+                mode="FULL",
                 strength=strength,
                 action=f"Trade only {four_h.direction.lower()} setups with 15M confirmation",
+                confluent_zones=zones,
+                four_h=four_h,
+                one_h=one_h,
+            )
+        if four_h.direction == RANGING and one_h.direction in {BULLISH, BEARISH}:
+            range_trade = self._range_alignment(four_h, one_h, zones)
+            if range_trade is not None:
+                return range_trade
+        if (
+            self.strategy.allow_1h_pullback_alignment
+            and four_h.direction in {BULLISH, BEARISH}
+            and one_h.direction in {BULLISH, BEARISH}
+            and one_h.direction != four_h.direction
+        ):
+            # The 4H trend is the law; the 1H is pulling back against it.  That
+            # pullback is where the discount/premium entry lives, so the trade
+            # still goes *with* the 4H — never against it.
+            return AlignmentResult(
+                aligned=True,
+                direction=four_h.direction,
+                mode="4H_PULLBACK",
+                strength="MODERATE",
+                action=(
+                    f"4H {four_h.direction} intact — 1H pullback is the entry; "
+                    f"trade {four_h.direction.lower()} at the 4H discount/premium only"
+                ),
+                monitor="Abort if the 4H prints a CHoCH against the position",
                 confluent_zones=zones,
                 four_h=four_h,
                 one_h=one_h,
@@ -339,6 +380,48 @@ class HTFBiasEngine:
             strength="WEAK",
             action=monitor,
             monitor=monitor,
+            confluent_zones=zones,
+            four_h=four_h,
+            one_h=one_h,
+        )
+
+    def _range_alignment(
+        self, four_h: HTFBias, one_h: HTFBias, zones: list[ConfluentZone]
+    ) -> AlignmentResult | None:
+        """Trade the 1H inside a ranging 4H, only from the correct range half.
+
+        Returns ``None`` when the setup is not a valid range trade (price on the
+        wrong side of equilibrium, no usable 4H dealing range, or range too
+        small to offer an edge).
+        """
+
+        if not self.strategy.allow_range_alignment:
+            return None
+        dealing_range = four_h.dealing_range
+        if dealing_range is None or dealing_range.size <= 0:
+            return None
+        price = float(four_h.current_price or one_h.current_price or 0.0)
+        if price <= 0:
+            return None
+        equity = dealing_range.equilibrium
+        direction = one_h.direction
+        if direction == BULLISH and price >= equity:
+            return None  # buying the premium of a range is chasing
+        if direction == BEARISH and price <= equity:
+            return None  # selling the discount of a range is chasing
+        # A range narrower than one 15M ATR offers no room to pay the spread.
+        if dealing_range.size < self.strategy.min_zone_width_pips * 4.0 * 0.10:
+            return None
+        return AlignmentResult(
+            aligned=True,
+            direction=direction,
+            mode="RANGE",
+            strength="MODERATE",
+            action=(
+                f"RANGE MODE — 4H ranging, trade {direction.lower()} from the "
+                f"{'discount' if direction == BULLISH else 'premium'} half of the 4H range"
+            ),
+            monitor="Range edge trade: target the opposite side of the 4H range; abort on a 4H BOS",
             confluent_zones=zones,
             four_h=four_h,
             one_h=one_h,
