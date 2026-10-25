@@ -30,6 +30,14 @@ python main.py dashboard --port 8501       # Streamlit dashboard
 
 Nothing above needs an API key, a network connection or a broker account.
 
+> **What `run` actually trades without credentials.** With no OANDA/Twelve Data
+> keys, `build_feed()` falls back to the deterministic synthetic feed. That feed
+> now advances with the wall clock (new 5M bars appear every 5 minutes and the
+> history is never rewritten), so `python main.py run` behaves like a live
+> session — but the prices are generated, not gold. For a forward test on real
+> prices, create a free **OANDA practice** account and put the token + account id
+> in `.env`; that is the only change needed.
+
 ### CLI
 
 | Command | Purpose |
@@ -289,7 +297,14 @@ force trades on synthetic noise.
 ## 10. Status & known limitations
 
 * Paper broker and synthetic generator are deterministic — reproducible tests,
-  no claim of realism.
+  no claim of realism. Without broker credentials `run` trades this synthetic
+  feed, not the real market (see §1).
+* Setups are rare by construction: on the 90-day reference dataset the H4
+  external structure is ranging for most of the sample, so `HTF_NOT_ALIGNED`
+  rejects the overwhelming majority of cycles. A three-day live paper session can
+  legitimately produce **zero** trades — that is the strategy being selective,
+  not a stalled engine. `python main.py status` and the dashboard's Risk tab show
+  the live rejection counters.
 * The economic-calendar fetch needs outbound network; when it is unavailable the
   filter fails **open** by design (`news.fail_closed: false`) and logs the
   condition. Set `fail_closed: true` to refuse all entries without a calendar.
