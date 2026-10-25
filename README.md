@@ -1,2 +1,302 @@
-# trading-bot
-a trading bot for forex traders
+# APEX-SMC — XAU/USD Institutional Algo Trading Engine
+
+Production-grade **Smart Money Concepts (SMC) / ICT** trading engine for XAU/USD.
+Async-native Python 3.11+, externalised configuration, structured JSON logging,
+hard risk limits, OANDA v20 execution (plus a deterministic paper broker),
+backtesting, walk-forward analysis and a Streamlit dashboard.
+
+> **Risk warning.** Leveraged gold trading is high risk and most retail algo
+> accounts lose money. This repository ships in **PAPER / SEMI_AUTO** mode with
+> live execution disabled behind three independent interlocks. Backtest output —
+> especially on synthetic data — is a plumbing check, **not** a profitability
+> claim.
+
+---
+
+## 1. Quick start
+
+```bash
+git clone <repo> trading-bot && cd trading-bot
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env && chmod 600 .env     # fill in credentials later
+
+python main.py validate-config             # sanity-check config + secrets
+python main.py selftest                    # offline smoke test of every module
+python main.py demo                        # one full decision cycle on synthetic data
+python main.py dashboard --port 8501       # Streamlit dashboard
+```
+
+Nothing above needs an API key, a network connection or a broker account.
+
+### CLI
+
+| Command | Purpose |
+| --- | --- |
+| `python main.py run` | Live/paper loop driven by APScheduler (5M trading, 30s management, 30min news) |
+| `python main.py once` | Exactly one decision cycle |
+| `python main.py demo` | One cycle on deterministic synthetic data (offline) |
+| `python main.py status` | Engine, account, risk and session snapshot |
+| `python main.py backtest [--days N] [--csv F] [--seed S] [--research]` | Backtest + performance report → `reports/backtest_*.json` |
+| `python main.py walkforward [--days N] [--folds K] [--json OUT]` | Rolling in-sample / out-of-sample stability analysis |
+| `python main.py approve <signal_id>` / `reject <signal_id>` | Semi-auto gate |
+| `python main.py dashboard [--port 8501]` | Read-only Streamlit dashboard |
+| `python main.py validate-config` | Config validation (exits 1 on failure) |
+| `python main.py selftest` | Offline component smoke test |
+
+Global flags: `--config PATH`, `--env-file PATH`, `--log-level LEVEL`.
+
+---
+
+## 2. Architecture
+
+```
+apex_smc_bot/
+├── config.py              frozen dataclasses, .env loading, validation
+├── logging_setup.py       JSON rotating logs (engine / signals / trades / errors)
+├── data/
+│   ├── feed_base.py       retry + backoff helpers shared by every feed
+│   ├── feed_oanda.py      OANDA v20 candles/pricing (primary)
+│   ├── feed_twelve.py     Twelve Data (fallback)
+│   ├── feed_mt5.py        MetaTrader 5 (tertiary, optional Windows dep)
+│   ├── candle_manager.py  multi-timeframe store, pip maths, resampling
+│   ├── database.py        SQLite: candles, signals, trades, equity, runtime state
+│   ├── synthetic.py       deterministic regime-switching market generator
+│   └── replay_feed.py     cursor-driven feed for backtests (no look-ahead)
+├── analysis/
+│   ├── structure.py       swings (N=3), BOS/CHoCH by close, dual (8/3) structure
+│   ├── order_blocks.py    OB detection, quality 1-5, mitigation / flip / breaker
+│   ├── fvg.py             3-candle imbalances + fill lifecycle + IFVG
+│   ├── liquidity.py       EQH/EQL (5-pip tolerance), sweeps, inducement, Judas
+│   ├── session.py         ICT kill-zone table (UTC) + dead zones
+│   ├── volume.py          volume expansion, delta, HVN/LVN
+│   ├── candle_psych.py    rejection/wick/body psychology
+│   ├── premium_discount.py dealing range, equilibrium, OTE 61.8-79 %
+│   ├── htf_bias.py        4H + 1H bias and alignment gate
+│   └── confluence.py      10-factor scoring matrix (min 7/10)
+├── signals/
+│   ├── signal_generator.py 15M arming + 7-check 5M trigger
+│   ├── signal_validator.py 16 validity checks before any order
+│   ├── signal_formatter.py JSON, text, Telegram, Discord, console
+│   ├── alternate_paths.py  Plan A / Plan B
+│   ├── smart_money.py      narrative simulation
+│   └── models.py           Signal, PendingSetup, TriggerResult (fingerprints)
+├── execution/
+│   ├── broker.py           Broker protocol, Position, OrderRequest/Result
+│   ├── paper_broker.py     deterministic fills, partials, immutable trade ledger
+│   ├── oanda_executor.py   OANDA v20 REST client (retry, partial close, OCO)
+│   ├── order_manager.py    routing, exposure accounting, semi-auto approvals
+│   ├── position_manager.py TP1/TP2 partials, breakeven, trailing, breaker close
+│   ├── trail_stop.py       breakeven / protective / ATR / structure trails
+│   └── lot_calculator.py   1 % risk sizing with broker lot constraints
+├── risk/
+│   ├── risk_engine.py      the single gate every order must pass
+│   ├── drawdown_monitor.py daily/D/D breaker, loss cooldowns (persisted)
+│   ├── spread_monitor.py   absolute limit + spike detection
+│   ├── news_filter.py      FOMC/NFP/CPI/PPI/JOLTS/ISM blackout ±30 min
+│   └── caution_zones.py    chop-box / missed-entry / stale-zone vetoes
+├── notifications/          Telegram (commands), Discord, email, console
+├── core/
+│   ├── engine.py           the decision loop (one function, fully typed)
+│   ├── scheduler.py        APScheduler jobs
+│   ├── state_manager.py    fingerprint ledger, counters, pause/resume
+│   └── selftest.py         offline end-to-end smoke test
+├── backtesting/
+│   ├── backtest_engine.py  replays history through the *live* engine
+│   ├── performance_metrics.py win rate, PF, expectancy, DD, Sharpe, Sortino
+│   └── walk_forward.py     rolling IS/OOS folds
+└── dashboard/
+    ├── chart_renderer.py   plotly candlesticks, equity, drawdown, histogram
+    └── streamlit_app.py    read-only operator dashboard
+```
+
+### The decision pipeline
+
+```
+data refresh ─▶ hard gates (session, weekend, breaker, news)
+             ─▶ position management (TP1/TP2 partials, breakeven, trail, stop)
+             ─▶ 4H bias ─▶ 1H bias ─▶ alignment gate
+             ─▶ 15M structure ─▶ OB / FVG / sweep ─▶ zone selection
+             ─▶ 10-factor confluence (≥7) ─▶ PendingSetup armed
+             ─▶ per 5M bar: 7-check trigger (≥6, checks 1 & 7 mandatory)
+             ─▶ validator (16 checks) ─▶ risk engine ─▶ broker
+```
+
+Every stage writes a structured log line, and every rejection carries a reason
+code (`HTF_NOT_ALIGNED`, `NO_CONFIRMED_SWEEP`, `MISSED_ENTRY`,
+`SESSION_NOT_TRADEABLE:…`, `RISK:…`, `VALIDATION:…`).
+
+---
+
+## 3. Strategy rules implemented
+
+**Structure** — fractal swings with `N=3` (internal) and `N=8` (external);
+BOS/CHoCH confirmed on candle **close**, never on a wick.
+
+**Order blocks** — last opposite candle before displacement, ATR guard on the
+origin candle, quality 1–5 (displacement, volume, freshness, confluence),
+lifecycle `UNMITIGATED → PARTIALLY_MITIGATED → FULLY_MITIGATED`, plus
+breaker/flip inversion.
+
+**Fair value gaps** — 3-candle imbalance with `min_gap_price` filter, fill
+ratio tracking, inverse-FVG support.
+
+**Liquidity** — EQH/EQL clustering at 5 pips, sweep detection (raid + close
+back inside), double inducement, Judas swing inside the first 30 min of the NY
+kill zone.
+
+**Sessions (UTC)** — London KZ 07:00–10:00, NY KZ 12:00–15:00 (12:00–12:30 =
+`NY_JUDAS_WINDOW`, non-tradeable); dead zones 00/05/12/21/23; London low 11,
+NY KZ high 13, NY afternoon low 15, NY close 18.
+
+**Entry model** — 15M zone (OB ± FVG) filtered to 4–30 pips wide and quality
+≥3; entry capped at 60 pips from price; premium/discount veto (no buys in
+premium, no sells in discount); OTE 61.8–79 %.
+
+**Trigger (5M, ≥6/7)** — **1** price traded into the zone within the last 3
+bars (a wick counts: that is what fills a limit order) and the market is not
+already beyond `max_entry_distance_pips` away, **2** rejection candle, **3**
+micro-BOS, **4** volume/delta, **5** wick ratio, **6** no opposing quality OB
+within 25/40 pips, **7** spread. Checks **1 and 7 are mandatory** — 6/7 without
+them never fires, and a stale zone can never confirm a fresh entry.
+
+**Targets** — TP1 1.5R (close 50 %, stop to breakeven), TP2 3R (close 25 %),
+TP3 5R runner with ATR/structure trail.
+
+**Risk** — 1 % per trade (0.5 % after 3 % daily drawdown), 5 % daily circuit
+breaker (24 h), max 2 concurrent trades **including resting orders and pending
+approvals**, spread ≤3.5 pips (spike ×2 → 15 min pause), SL 5–50 pips,
+lots 0.01–10, 2 h/4 h loss cool-downs, ≥30 min news blackout.
+
+---
+
+## 4. Configuration
+
+Everything operational is in [`config.yaml`](config.yaml); secrets only ever in
+`.env`. `Settings` is a frozen dataclass tree with a `validate()` pass that is
+run by `main.py validate-config` and again at engine start.
+
+```bash
+APEX_CONFIG=config.yaml
+APEX_EXECUTION_MODE=SEMI_AUTO     # overrides bot.execution_mode
+APEX_ALLOW_LIVE=false             # extra interlock for a live account
+```
+
+Live trading requires **all three**: `execution.broker: oanda`,
+`execution.allow_live_trading: true`, and an `OANDA_ACCESS_TOKEN` pointing at a
+live host. Anything else stays on paper.
+
+---
+
+## 5. Testing
+
+```bash
+python -m pytest apex_smc_bot/tests -q
+```
+
+The suite is offline and deterministic (synthetic data, pinned clock):
+structure, order blocks, FVG, liquidity, signals/validator/formatter, risk,
+execution, plus `python main.py selftest` for the integrated pipeline.
+
+---
+
+## 6. Backtesting & walk-forward
+
+```bash
+python main.py backtest --days 90 --seed 11
+python main.py walkforward --days 120 --folds 4 --json reports/wf.json
+```
+
+Both replay history through the **production** `TradingEngine` and
+`PositionManager` — not a re-implementation — so execution, partial closes and
+risk vetoes behave exactly as they do live. The feed is cursor-based: no bar
+after the cycle timestamp is ever visible.
+
+* reports are written to `reports/backtest_*.json`
+* fewer than 20 trades is flagged as statistically meaningless
+* `--research` relaxes the confluence/5M gates; it is for synthetic-data
+  studies only and is never a default
+
+Supply real data with `--csv` (columns: `timestamp,open,high,low,close,volume[,spread]`).
+
+---
+
+## 7. Deployment (systemd)
+
+```bash
+sudo ./deploy/install.sh          # user, venv, units, logrotate, secrets file
+sudoedit /etc/apex-smc/apex.env   # OANDA + Telegram credentials
+sudo systemctl enable --now apex-smc apex-smc-dashboard
+journalctl -u apex-smc -f
+```
+
+`deploy/apex-smc.service` runs the engine with `ProtectSystem=strict`,
+`NoNewPrivileges`, a restricted `ReadWritePaths` set and automatic restart.
+`deploy/apex-smc-dashboard.service` binds Streamlit to `127.0.0.1:8501` — put it
+behind an authenticating reverse proxy. `deploy/logrotate.conf` rotates the JSON
+logs daily (30 days).
+
+Health checks:
+
+```bash
+python main.py status                    # engine snapshot
+curl -s localhost:8501/_stcore/health    # dashboard health
+```
+
+---
+
+## 8. Logging & notifications
+
+Structured JSON to `logs/` with rotation (`engine`, `signals`, `trades`,
+`errors`), plus a console stream. Every signal is emitted **simultaneously** as
+structured JSON and human-readable text to console, log, SQLite, Telegram and
+(optionally) Discord. Telegram also accepts `/status`, `/positions`,
+`/approve <id>`, `/reject <id>`, `/close <id>`, `/closeall`, `/pause`,
+`/resume`, `/signals`.
+
+---
+
+## 9. Measured behaviour (synthetic data)
+
+Reproducible reference run — 90 days of deterministic synthetic gold, ending
+2026-10-07 14:00 UTC:
+
+```bash
+python main.py backtest --days 90 --seed 11 --end 2026-10-07T14:00Z
+```
+
+```
+18,443 cycles · 5 trades (3W / 2L) · win rate 60 % · profit factor 2.18
+Net P/L +$147.90 (+1.48 %) · expectancy +$29.58/trade
+Max drawdown $424.81 (4.07 %) · Sharpe 5.25 · Sortino 11.07
+```
+
+**Read this correctly.** Five trades is far below the 20-trade minimum the
+report itself flags, the data is synthetic (regime-switching noise, not gold),
+and the sample size makes Sharpe/PF meaningless. What the run does demonstrate
+is that the whole pipeline executes: arming → 5M trigger → validation → risk
+gate → order → partial closes → trailing stop → performance report, with the
+max-two-exposure limit holding (no more than two positions ever open).
+
+Trade frequency is low by design and by data. On this dataset the H4 external
+structure spends most of its time ranging, so `HTF_NOT_ALIGNED` (a hard law)
+rejects the majority of cycles — the same reason the walk-forward folds show
+0–1 trades each. With real XAU/USD history (pass `--csv`) and years of data,
+expect a different and more meaningful distribution. Do not tune thresholds to
+force trades on synthetic noise.
+
+## 10. Status & known limitations
+
+* Paper broker and synthetic generator are deterministic — reproducible tests,
+  no claim of realism.
+* The economic-calendar fetch needs outbound network; when it is unavailable the
+  filter fails **open** by design (`news.fail_closed: false`) and logs the
+  condition. Set `fail_closed: true` to refuse all entries without a calendar.
+* MetaTrader 5 is optional and Windows-only; the feed degrades gracefully.
+* Gold CFDs have no central exchange — broker feed differences (spread, gaps)
+  matter more than any parameter in this repository.
+
+## 11. License
+
+See [LICENSE](LICENSE).

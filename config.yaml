@@ -1,0 +1,191 @@
+# =============================================================================
+# APEX-SMC Institutional Algo Trading Engine — configuration
+# =============================================================================
+# Every operational value lives here.  Secrets (API keys, tokens) belong in
+# .env and are NEVER read from this file.
+#
+# Environment overrides (optional):
+#   APEX_CONFIG          path to this file            (default: config.yaml)
+#   APEX_EXECUTION_MODE  SEMI_AUTO | FULL_AUTO
+#   APEX_ALLOW_LIVE      true | false  (extra interlock for a live account)
+# =============================================================================
+
+bot:
+  name: APEX-SMC
+  version: 1.0.0
+  instrument: XAU_USD          # OANDA instrument name — XAU/USD spot gold
+  execution_mode: SEMI_AUTO    # SEMI_AUTO requires /approve before routing
+  timezone: UTC
+
+# ----------------------------------------------------------------------------
+# Execution
+# ----------------------------------------------------------------------------
+execution:
+  broker: paper                # paper | oanda
+  allow_live_trading: false    # triple interlock: this + .env + OANDA live host
+  oanda_environment: practice  # practice | live
+  max_retries: 3
+  retry_backoff_seconds: 1.5
+  order_timeout_seconds: 20.0
+  pending_order_ttl_minutes: 120
+  paper_starting_equity: 10000.0
+  paper_auto_approve: true     # paper mode may auto-approve so demos run hands-off
+
+# ----------------------------------------------------------------------------
+# Risk — the hard limits.  Do not raise the per-trade risk above 2 %.
+# ----------------------------------------------------------------------------
+risk:
+  max_risk_per_trade_percent: 1.0     # LAW: max 2 %, default 1 %
+  max_daily_loss_percent: 5.0         # daily circuit breaker
+  reduce_risk_threshold_percent: 3.0  # halve risk after this daily drawdown
+  reduced_risk_percent: 0.5
+  max_open_trades: 2
+  max_spread_pips: 3.5
+  max_slippage_pips: 2.0
+  max_sl_pips: 50.0
+  min_sl_pips: 5.0
+  pip_size: 0.10                      # XAU/USD: 1 pip = $0.10
+  pip_value_per_lot: 10.0             # 1.00 lot = 100 oz = $10 per pip
+  contract_size: 100.0                # ounces per lot
+  min_lot: 0.01
+  max_lot: 10.0
+  daily_halt_hours: 24.0
+  cooldown_after_loss_hours: 2.0
+  cooldown_after_two_losses_hours: 4.0
+  max_consecutive_losses: 2
+  spread_spike_multiplier: 2.0        # pause when spread doubles
+  spread_pause_minutes: 15
+  min_equity: 100.0
+  starting_equity: 10000.0
+  trailing_breakeven_buffer_pips: 1.0
+  max_position_age_hours: 48.0
+
+# ----------------------------------------------------------------------------
+# Strategy
+# ----------------------------------------------------------------------------
+strategy:
+  swing_lookback: 3                 # fractal swing strength (N=3)
+  external_swing_lookback: 8        # major swings for liquidity
+  min_confluence_score: 7.0         # LAW: < 7/10 = no trade
+  min_fivem_checks: 6               # 6 of 7 five-minute confirmations
+  ob_lookback_candles: 100
+  fvg_lookback_candles: 100
+  ote_low_fib: 0.618
+  ote_high_fib: 0.79
+  equal_level_tolerance_pips: 5.0
+  max_signal_age_minutes: 240      # a 15M setup stays armed for 4 hours
+  sl_buffer_pips: 5.0               # SL sits this far outside the OB
+  min_sl_atr_fraction: 0.8          # never place a stop inside one ATR of noise
+  min_rr_tp1: 1.5
+  min_rr_tp2: 3.0
+  target_rr_tp3: 5.0
+  ob_freshness_hours: 48.0
+  fvg_freshness_hours: 24.0
+  sweep_lookahead_candles: 16
+  inducement_lookback_candles: 12
+  min_zone_width_pips: 4.0         # skip micro OB/FVG bands (< $0.40 on gold)
+  max_zone_width_pips: 30.0        # wider "zones" are structure, not entries
+  tp1_close_fraction: 0.5           # close 50 % at TP1
+  tp2_close_fraction: 0.25          # close 25 % at TP2
+  max_entry_distance_pips: 60.0     # do not chase beyond this distance
+  opposing_ob_warning_pips: 25.0    # half size
+  opposing_ob_abort_pips: 40.0      # veto
+  min_obstacle_quality: 3           # weak (<3) opposing blocks are noise on gold
+  zone_touch_bars: 3                # an OB/FVG stays "in play" for N five-minute bars
+  chopbox_lookback: 10
+  chopbox_max_range_pips: 20.0
+
+# ----------------------------------------------------------------------------
+# Sessions (UTC).  Entries are only allowed inside kill zones.
+# ----------------------------------------------------------------------------
+sessions:
+  london_kill_zone_start: "07:00"
+  london_kill_zone_end: "10:00"
+  ny_kill_zone_start: "12:00"
+  ny_kill_zone_end: "15:00"
+  ny_close_start: "18:00"
+  ny_close_end: "20:00"
+  judas_window_minutes: 30
+
+# ----------------------------------------------------------------------------
+# Notifications — enable a channel here and put credentials in .env
+# ----------------------------------------------------------------------------
+notifications:
+  telegram_enabled: false
+  discord_enabled: false
+  email_enabled: false
+  console_enabled: true
+  timeout_seconds: 10.0
+  max_retries: 3
+
+# ----------------------------------------------------------------------------
+# Logging
+# ----------------------------------------------------------------------------
+logging:
+  level: INFO
+  directory: logs
+  json_logs: true
+  max_bytes: 10485760
+  backup_count: 5
+  signal_log: signals.log
+  trade_log: trades.log
+  error_log: errors.log
+  analysis_log: analysis.log
+
+# ----------------------------------------------------------------------------
+# Data feed — primary → secondary → tertiary failover
+# ----------------------------------------------------------------------------
+feed:
+  primary: oanda
+  secondary: twelve
+  tertiary: mt5
+  historical_bars: 500
+  request_timeout_seconds: 15.0
+  max_retries: 3
+  synthetic_seed: 7
+
+# ----------------------------------------------------------------------------
+# Database
+# ----------------------------------------------------------------------------
+database:
+  enabled: true
+  path: apex_state.sqlite3
+
+# ----------------------------------------------------------------------------
+# Economic calendar / news blackout
+# ----------------------------------------------------------------------------
+news:
+  enabled: true
+  calendar_url: https://nfs.faireconomy.media/ff_calendar_thisweek.json
+  cache_minutes: 30
+  block_minutes_before: 30
+  block_minutes_after: 30
+  fail_closed: false            # true = stop trading when the calendar is unreachable
+  high_impact_keywords:
+    - FOMC
+    - NFP
+    - Non-Farm
+    - CPI
+    - PPI
+    - JOLTS
+    - ISM
+    - Powell
+    - Federal Funds
+    - GDP
+    - PCE
+    - Unemployment
+    - Retail Sales
+
+# ----------------------------------------------------------------------------
+# Backtesting
+# ----------------------------------------------------------------------------
+backtest:
+  days: 60
+  initial_equity: 10000.0
+  spread_pips: 2.0
+  slippage_pips: 0.5
+  commission_per_lot: 0.0
+  risk_percent: 1.0
+  seed: 42
+  data_csv: null
+  min_trades_for_report: 20

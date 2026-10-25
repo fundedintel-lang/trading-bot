@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets & local runtime
+.env
+*.env
+!.env.example
+.state/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+apex_state.sqlite3
+
+# Logs / artifacts
+logs/*.log
+logs/*.log.*
+reports/
+artifacts/
+.coverage
+htmlcov/
