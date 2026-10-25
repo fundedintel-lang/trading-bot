@@ -318,6 +318,7 @@ before drawing any conclusion, and require ≥100 trades per profile.
 * Frequency is not the same thing as edge. The high-frequency profile produces
   13× more trades than the conservative one on the same 90-day sample and still
   does not demonstrate a positive expectancy. Validate on real data first.
+
 * The economic-calendar fetch needs outbound network; when it is unavailable the
   filter fails **open** by design (`news.fail_closed: false`) and logs the
   condition. Set `fail_closed: true` to refuse all entries without a calendar.
