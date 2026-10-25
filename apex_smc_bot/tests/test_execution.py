@@ -257,3 +257,20 @@ def test_trail_stop_returns_none_before_tp1():
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_profitable_stop_is_labelled_a_trail_not_a_loss():
+    """A stop trailed above the entry must not be journalled as STOP_LOSS."""
+
+    settings = Settings()
+    broker = PaperBroker(starting_equity=10_000, slippage_price=0.0)
+    await broker.mark_price(2350.0, 0.20, T0)
+    await broker.submit_order(_request(units=40), 2350.0, 0.0)
+    await broker.modify_stop(broker.get_open_positions()[0].trade_id, 2345.0)
+    manager = PositionManager(settings, broker)
+    events = await manager.on_price(2346.0, 0.0, [], T0 + timedelta(minutes=30))
+    assert events
+    record = broker.get_history()[0]
+    assert record.realized_pnl > 0
+    assert record.metadata["close_reason"] in {"TRAIL_STOP", "BREAKEVEN_STOP"}
