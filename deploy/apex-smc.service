@@ -1,0 +1,48 @@
+[Unit]
+Description=APEX-SMC institutional gold trading engine (XAU/USD)
+Documentation=file:///opt/apex-smc/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=apex
+Group=apex
+WorkingDirectory=/opt/apex-smc
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+# Secrets live in /etc/apex-smc/apex.env (root-owned, chmod 600) — never in the unit.
+EnvironmentFile=-/etc/apex-smc/apex.env
+ExecStart=/opt/apex-smc/.venv/bin/python main.py run --config /opt/apex-smc/config.yaml --env-file /etc/apex-smc/apex.env --log-level INFO
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+TimeoutStopSec=45
+KillSignal=SIGTERM
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/opt/apex-smc/logs /opt/apex-smc/reports /opt/apex-smc/data
+# Keep the intraday CPU budget realistic for a 5-minute scheduler on a shared VM.
+Nice=5
+CPUQuota=150%
+
+# --- logging / limits ------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apex-smc
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

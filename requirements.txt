@@ -1,0 +1,20 @@
+# APEX-SMC runtime dependencies (Python 3.11+)
+aiohttp>=3.9,<4
+APScheduler>=3.10,<4
+numpy>=1.26
+pandas>=2.1
+plotly>=5.20
+PyYAML>=6.0
+requests>=2.31
+structlog>=24.1
+
+# Dashboard
+streamlit>=1.33
+
+# Optional third-party integrations
+# MetaTrader5>=5.0.45        # Windows only; feed_mt5.py degrades gracefully
+# oandapyV20>=0.7.2          # not required — the v20 REST client is built in
+
+# Development / tests
+pytest>=8.0
+pytest-asyncio>=0.23

@@ -1,0 +1,32 @@
+[Unit]
+Description=APEX-SMC Streamlit dashboard (read-only, localhost)
+Documentation=file:///opt/apex-smc/README.md
+After=network-online.target apex-smc.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=apex
+Group=apex
+WorkingDirectory=/opt/apex-smc
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-/etc/apex-smc/apex.env
+ExecStart=/opt/apex-smc/.venv/bin/python -m streamlit run apex_smc_bot/dashboard/streamlit_app.py \
+    --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false
+Restart=always
+RestartSec=5
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/apex-smc/logs
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apex-smc-dashboard
+
+[Install]
+WantedBy=multi-user.target
