@@ -147,8 +147,10 @@ def test_high_frequency_preset_loads_and_respects_the_cap():
 
 
 # --------------------------------------------------------------- time stop
-@pytest.mark.asyncio
-async def test_position_older_than_the_time_stop_is_closed():
+async def _aged_position(price_offset: float, hours: float = 3.0):
+    """Open a long, then run one management pass some hours later."""
+
+    from apex_smc_bot.execution.order_manager import OrderRequest
     from apex_smc_bot.execution.paper_broker import PaperBroker
     from apex_smc_bot.execution.position_manager import PositionManager
 
@@ -159,8 +161,6 @@ async def test_position_older_than_the_time_stop_is_closed():
         database=replace(settings.database, enabled=False),
     )
     broker = PaperBroker(starting_equity=10_000.0)
-    from apex_smc_bot.execution.order_manager import OrderRequest
-
     request = OrderRequest(
         signal_id="SIG-TIME",
         instrument="XAU_USD",
@@ -175,10 +175,78 @@ async def test_position_older_than_the_time_stop_is_closed():
     manager = PositionManager(settings, broker, None)
     opened = broker._clock
     events = await manager.on_price(
-        3301.0, spread_price=0.20, candles_5m=None, now=opened + timedelta(hours=3)
+        3300.0 + price_offset,
+        spread_price=0.20,
+        candles_5m=None,
+        now=opened + timedelta(hours=hours),
     )
+    return broker, events
+
+
+@pytest.mark.asyncio
+async def test_stale_losing_position_is_closed_by_the_time_stop():
+    broker, events = await _aged_position(price_offset=-1.0)
     assert any(event.kind == "TIME_EXIT" for event in events)
     assert not broker.get_open_positions()
+
+
+@pytest.mark.asyncio
+async def test_stale_winner_is_allowed_to_run_past_the_time_stop():
+    broker, events = await _aged_position(price_offset=+1.0)
+    assert not any(event.kind == "TIME_EXIT" for event in events)
+    assert broker.get_open_positions()
+
+
+@pytest.mark.asyncio
+async def test_winner_is_still_capped_at_twice_the_max_age():
+    broker, events = await _aged_position(price_offset=+1.0, hours=5.0)
+    assert any(event.kind == "TIME_EXIT" for event in events)
+    assert not broker.get_open_positions()
+
+
+def test_breakeven_after_tp1_can_be_disabled():
+    from apex_smc_bot.execution.trail_stop import next_stop
+
+    common = dict(
+        entry=3300.0,
+        current_stop=3290.0,
+        direction=BULLISH,
+        market_price=3315.0,
+        tp1=3310.0,
+        tp2=3330.0,
+        tp1_hit=True,
+        tp2_hit=False,
+    )
+    spec = next_stop(**common)
+    assert spec is not None and spec.stage == "BREAKEVEN"
+    runner = next_stop(**common, breakeven_after_tp1=False)
+    assert runner is None
+
+
+def test_daily_trend_reads_the_4h_series(make_candle):
+    from datetime import datetime, timedelta, timezone
+
+    from apex_smc_bot.analysis.htf_bias import HTFBiasEngine
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def series(prices):
+        return [
+            make_candle(p, p + 0.6, p - 0.6, p, base + timedelta(hours=4 * i))
+            for i, p in enumerate(prices)
+        ]
+
+    rising = series([2300 + i * 2.0 for i in range(160)])
+    falling = series([2300 - i * 2.0 for i in range(160)])
+    flat = series([2300 + (0.3 if i % 2 else -0.3) for i in range(160)])
+    assert HTFBiasEngine.daily_trend(rising) == BULLISH
+    assert HTFBiasEngine.daily_trend(falling) == BEARISH
+    assert HTFBiasEngine.daily_trend(flat) == RANGING
+    assert HTFBiasEngine.daily_trend(rising[:40]) == RANGING  # not enough history
+
+
+def test_daily_trend_filter_is_off_by_default():
+    assert Settings().strategy.daily_trend_filter is False
 
 
 def test_pending_setup_helpers_still_round_trip(session_candles):

@@ -59,6 +59,8 @@ risk:
   starting_equity: 10000.0
   trailing_breakeven_buffer_pips: 1.0
   max_position_age_hours: 48.0
+  breakeven_after_tp1: true         # spec default; false lets the 3R/5R runner breathe
+  time_exit_only_losers: true       # stale winners get 2x the age cap, then close
 
 # ----------------------------------------------------------------------------
 # Strategy

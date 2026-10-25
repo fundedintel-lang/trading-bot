@@ -275,17 +275,24 @@ python main.py backtest --days 90 --seed 11 --end 2026-10-07T14:00Z
 python main.py --config configs/high_frequency.yaml backtest --days 90 --seed 11 --end 2026-10-07T14:00Z
 ```
 
-| Profile | Trades | Trades/day | Win rate | Profit factor | Net P/L | Max DD |
-|---|---|---|---|---|---|---|
-| Conservative (`config.yaml`) | 15 | 0.17 | 26.7 % | 0.60 | −$259.26 | 4.52 % |
-| High frequency (`configs/high_frequency.yaml`, 4 × 0.5 %) | 157 | **1.74** | 47.8 % | 0.93 | −$174.66 | 10.07 % |
+| Profile | Trades | Trades/day | Win rate | Payoff | Profit factor | Net P/L | Max DD |
+|---|---|---|---|---|---|---|---|
+| Conservative (`config.yaml`) | 15 | 0.17 | 26.7 % | 1.64:1 | 0.60 | −$259.26 | 4.52 % |
+| High frequency (`configs/high_frequency.yaml`, 4 × 0.5 %) | 91 | **1.01** | 33.0 % | 1.99:1 | 0.98 | −$36.24 | 5.37 % |
 
-Both runs are far below the 20-trade statistical minimum, the data is synthetic
-(regime-switching noise, not gold), and neither result says anything reliable
-about profitability. What they *do* demonstrate is throughput: the whole
-pipeline executes end to end and the high-frequency profile really does put
-~1.7 orders a day into the market without breaking a single hard law (max 2 %
-exposure, 5 % daily halt, news blackout, spread cap).
+Both runs are far below the 20-trade statistical minimum for the conservative
+profile, the data is synthetic (regime-switching noise, not gold), and neither
+result says anything reliable about profitability. What they *do* demonstrate is
+throughput and cost discipline: the high-frequency profile puts ~1 order a day
+into the market without breaking a single hard law (max 2 % exposure, 5 % daily
+halt, news blackout, spread cap) and lands within 1 % of break-even **after**
+paying the spread on every trade.
+
+The exit engine is the reason the payoff column is no longer ~1:1: TP1 is
+floored at 1.5R, the stop only moves after TP2
+(`risk.breakeven_after_tp1: false`) and the time stop only closes positions that
+are not working (`risk.time_exit_only_losers: true`). See
+[docs/FREQUENCY.md](docs/FREQUENCY.md) §3 for the full before/after.
 
 ### Trade frequency is a knob, not a bug
 

@@ -86,6 +86,16 @@ class RiskConfig:
     min_equity: float = 100.0
     starting_equity: float = 10_000.0
     trailing_breakeven_buffer_pips: float = 1.0
+    # Move the stop to breakeven as soon as TP1 fills (spec default).  Setting
+    # this False keeps the original stop alive until TP2, so the runner is not
+    # scratched at entry by a normal pullback — measured on the 90-day sample,
+    # the breakeven-after-TP1 rule was capping the realised payoff at ~1:1
+    # while the plan is 1.5R/3R/5R.
+    breakeven_after_tp1: bool = True
+    # The time stop closes stale positions.  When True (default) it only closes
+    # the ones that are not in profit, so a runner cannot be cut at +0.4R just
+    # because it is old; winners get a hard cap at twice max_position_age_hours.
+    time_exit_only_losers: bool = True
     max_position_age_hours: float = 48.0
 
     def __post_init__(self) -> None:
@@ -153,6 +163,11 @@ class StrategyConfig:
     # have to agree: a 1H pullback *inside* a 4H trend is the classic discount
     # entry.  When False only fully aligned 4H+1H setups may arm.
     allow_1h_pullback_alignment: bool = True
+    # Hard daily trend filter.  When enabled a setup may only be taken in the
+    # direction of the D1 trend (close vs its 20-day EMA and the EMA's slope,
+    # derived from the 4H series).  Counter-trend intraday bounces inside a
+    # daily trend are the most expensive trades in the sample.
+    daily_trend_filter: bool = False
     allow_range_alignment: bool = True
     # A ranging 15M is "no structure", not "conflicting structure": the sweep,
     # the zone and the HTF bias already carry the edge.
