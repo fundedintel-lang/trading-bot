@@ -44,6 +44,7 @@ from apex_smc_bot.analysis.session import Session
 from apex_smc_bot.analysis.structure import (
     BEARISH,
     BULLISH,
+    RANGING,
     StructureState,
     detect_micro_bos,
     has_recent_event,
@@ -181,9 +182,19 @@ class SignalGenerator:
         price = float(current_price if current_price is not None else candles[-1].close)
         pip = self.risk.pip_size
 
-        # 15M structure must agree or have produced a fresh event in-direction.
-        if structure.direction != direction and not has_recent_event(
-            structure.events, direction, 24, len(candles)
+        # 15M structure must agree, be a tradeable range, or have produced a
+        # fresh event in-direction.  A *ranging* 15M is the absence of structure
+        # rather than a conflict: the sweep, the zone and the HTF bias are what
+        # provide the edge, and most reversal entries print out of consolidation.
+        structure_blocks = self.strategy.require_15m_structure and (
+            structure.direction not in {direction, RANGING}
+            or (structure.direction == RANGING and not self.strategy.allow_15m_ranging)
+        )
+        if structure_blocks and not has_recent_event(
+            structure.events,
+            direction,
+            self.strategy.structure_event_window_bars,
+            len(candles),
         ):
             self.last_rejection = "15M_STRUCTURE_CONFLICT"
             return None
@@ -194,10 +205,14 @@ class SignalGenerator:
             direction,
             total_candles=len(candles),
             max_age=max(36, self.strategy.inducement_lookback_candles + 24),
-            require_confirmed=True,
+            require_confirmed=self.strategy.require_sweep_confirmation,
         )
-        if sweep is None or sweep.quality != "HIGH":
-            self.last_rejection = "NO_CONFIRMED_SWEEP"
+        quality_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+        min_rank = quality_rank.get(self.strategy.min_sweep_quality.upper(), 2)
+        if sweep is None or quality_rank.get(sweep.quality, 0) < min_rank:
+            self.last_rejection = (
+                "NO_CONFIRMED_SWEEP" if sweep is None else f"SWEEP_QUALITY_{sweep.quality}"
+            )
             return None
 
         # Best demand/supply zone on the correct side of price.
@@ -211,7 +226,12 @@ class SignalGenerator:
             self.last_rejection = "ZONE_INVALIDATED_BY_PRICE"
             return None
 
-        if abs(price - entry) > self.strategy.max_entry_distance_pips * pip:
+        arm_radius = (
+            self.strategy.arm_entry_distance_pips
+            if self.strategy.arm_entry_distance_pips > 0
+            else self.strategy.max_entry_distance_pips
+        )
+        if abs(price - entry) > arm_radius * pip:
             self.last_rejection = "MISSED_ENTRY"
             return None
 
@@ -219,7 +239,7 @@ class SignalGenerator:
             dealing_range = dealing_range_from_structure(
                 structure, self.strategy.ote_low_fib, self.strategy.ote_high_fib
             )
-        if dealing_range is not None:
+        if dealing_range is not None and self.strategy.require_premium_discount:
             if direction == BULLISH and entry > dealing_range.equilibrium:
                 self.last_rejection = "BUY_IN_PREMIUM"
                 return None
@@ -320,7 +340,7 @@ class SignalGenerator:
         min_width = self.strategy.min_zone_width_pips * pip
         max_width = self.strategy.max_zone_width_pips * pip
         for ob in active_order_blocks(obs, direction=direction):
-            if ob.quality < 3:
+            if ob.quality < self.strategy.min_zone_ob_quality:
                 continue
             if not min_width <= ob.height <= max_width:
                 # Micro blocks are noise; 50-pip "zones" are structure, not entries.
@@ -828,6 +848,7 @@ class SignalGenerator:
             ),
             sl_structure_based=True,
             htf_aligned=alignment.aligned,
+            htf_mode=getattr(alignment, "mode", "FULL"),
         )
 
     # ------------------------------------------------------------------ signal
@@ -845,8 +866,26 @@ class SignalGenerator:
         spread_pips: float = 0.0,
         normal_spread_pips: float = 0.0,
         now: datetime | None = None,
+        market_price: float | None = None,
     ) -> Signal | None:
-        """Convert an approved trigger into a complete :class:`Signal`."""
+        """Convert an approved trigger into a complete :class:`Signal`.
+
+        Args:
+            pending: The armed setup.
+            trigger: The confirmed 5M trigger.
+            alignment: Current HTF alignment.
+            confluence: Pre-computed confluence result (optional).
+            setup: Pre-computed confluence input (optional).
+            account_equity: Live equity used for sizing.
+            risk_percent: Base risk percent before the confluence size factor.
+            order_blocks: 15M blocks for the alternate-path plans.
+            fvgs: 15M FVGs for the alternate-path plans.
+            spread_pips: Current spread.
+            normal_spread_pips: Baseline spread.
+            now: Clock.
+            market_price: Live price.  Required for ``strategy.entry_mode=MARKET``
+                so the fill price is the price the order is actually sent at.
+        """
 
         self.last_rejection = None
         now = to_utc(now or utcnow())
@@ -866,6 +905,24 @@ class SignalGenerator:
             self.last_rejection = confluence.abort_reason or f"CONFLUENCE_{confluence.score}"
             return None
 
+        # Entry price: either the resting limit at the zone edge, or the live
+        # price when the operator runs the MARKET profile (fills the trigger
+        # immediately instead of waiting for a pullback that often never comes).
+        entry_price = float(pending.entry_price)
+        entry_type = "LIMIT"
+        if str(self.strategy.entry_mode).upper() == "MARKET":
+            if market_price is None or market_price <= 0:
+                self.last_rejection = "MARKET_ENTRY_WITHOUT_PRICE"
+                return None
+            entry_price = round(float(market_price), 2)
+            entry_type = "MARKET"
+            if pending.direction == BULLISH and pending.stop_loss >= entry_price:
+                self.last_rejection = "STOP_ON_WRONG_SIDE_OF_MARKET"
+                return None
+            if pending.direction == BEARISH and pending.stop_loss <= entry_price:
+                self.last_rejection = "STOP_ON_WRONG_SIDE_OF_MARKET"
+                return None
+
         equity = float(account_equity if account_equity is not None else self.risk.starting_equity)
         base_risk = float(
             risk_percent if risk_percent is not None else self.risk.max_risk_per_trade_percent
@@ -873,16 +930,28 @@ class SignalGenerator:
         effective_risk = max(0.01, base_risk * confluence.position_fraction)
         try:
             sizing = calculate_position(
-                equity, effective_risk, pending.entry_price, pending.stop_loss, self.risk, pending.direction
+                equity, effective_risk, entry_price, pending.stop_loss, self.risk, pending.direction
             )
         except Exception as exc:  # noqa: BLE001 - sizing failures are business rejections
             self.last_rejection = f"SIZING_FAILED: {exc}"
             return None
 
-        risk_distance = abs(pending.entry_price - pending.stop_loss)
-        rr1 = abs(pending.tp1 - pending.entry_price) / risk_distance if risk_distance else 0.0
-        rr2 = abs(pending.tp2 - pending.entry_price) / risk_distance if risk_distance else 0.0
-        rr3 = abs(pending.tp3 - pending.entry_price) / risk_distance if risk_distance else 0.0
+        risk_distance = abs(entry_price - pending.stop_loss)
+        tp1, tp2, tp3 = pending.tp1, pending.tp2, pending.tp3
+        if entry_type == "MARKET" and risk_distance > 0:
+            # A market fill can sit above (long) or below (short) the zone entry,
+            # which shrinks the distance to the zone-based TP1.  Floor TP1 at the
+            # configured R multiple so the trade never risks 1R to make 0.6R.
+            signed = 1.0 if pending.direction == BULLISH else -1.0
+            floor_tp1 = entry_price + signed * risk_distance * self.strategy.min_rr_tp1
+            if (signed > 0 and tp1 < floor_tp1) or (signed < 0 and tp1 > floor_tp1):
+                tp1 = round(floor_tp1, 2)
+            # Keep the ladder ordered after the floor moved TP1.
+            tp2 = tp1 + signed * max(abs(tp2 - tp1), 0.1)
+            tp3 = tp2 + signed * max(abs(tp3 - tp2), 0.1)
+        rr1 = abs(tp1 - entry_price) / risk_distance if risk_distance else 0.0
+        rr2 = abs(tp2 - entry_price) / risk_distance if risk_distance else 0.0
+        rr3 = abs(tp3 - entry_price) / risk_distance if risk_distance else 0.0
         if rr1 < 1.0:
             self.last_rejection = "TP1_BELOW_1R"
             return None
@@ -893,22 +962,22 @@ class SignalGenerator:
         risk_rr = RiskReward(rr_to_tp1=round(rr1, 2), rr_to_tp2=round(rr2, 2), rr_to_tp3=round(rr3, 2))
         tps = TakeProfitPlan(
             tp1=TakeProfit(
-                price=pending.tp1,
-                distance_pips=round(abs(pending.tp1 - pending.entry_price) / pip, 1),
+                price=tp1,
+                distance_pips=round(abs(tp1 - entry_price) / pip, 1),
                 basis=pending.tp1_basis or self._basis_for_target(pending, 1),
                 size_to_close=f"{self.strategy.tp1_close_fraction:.0%}",
                 rr=round(rr1, 2),
             ),
             tp2=TakeProfit(
-                price=pending.tp2,
-                distance_pips=round(abs(pending.tp2 - pending.entry_price) / pip, 1),
+                price=tp2,
+                distance_pips=round(abs(tp2 - entry_price) / pip, 1),
                 basis=pending.tp2_basis or self._basis_for_target(pending, 2),
                 size_to_close=f"{self.strategy.tp2_close_fraction:.0%}",
                 rr=round(rr2, 2),
             ),
             tp3=TakeProfit(
-                price=pending.tp3,
-                distance_pips=round(abs(pending.tp3 - pending.entry_price) / pip, 1),
+                price=tp3,
+                distance_pips=round(abs(tp3 - entry_price) / pip, 1),
                 basis=pending.tp3_basis or self._basis_for_target(pending, 3),
                 size_to_close="remaining (trail after TP2)",
                 rr=round(rr3, 2),
@@ -972,7 +1041,7 @@ class SignalGenerator:
 
         plan_a, plan_b = generate_alternate_paths(
             pending,
-            entry=pending.entry_price,
+            entry=entry_price,
             stop_loss=pending.stop_loss,
             tp1=pending.tp1,
             tp2=pending.tp2,
@@ -997,16 +1066,16 @@ class SignalGenerator:
             instrument=self.settings.bot.instrument,
             direction=direction,
             entry=EntryPlan(
-                price=pending.entry_price,
+                price=entry_price,
                 zone_low=pending.zone_low,
                 zone_high=pending.zone_high,
                 zone=pending.zone_basis,
-                type="LIMIT",
+                type=entry_type,
                 valid_until=pending.expires_at,
             ),
             stop_loss=StopLossPlan(
                 price=pending.stop_loss,
-                distance_pips=sl_distance_pips(pending.entry_price, pending.stop_loss, pip),
+                distance_pips=sl_distance_pips(entry_price, pending.stop_loss, pip),
                 basis=f"Outside zone + {self.strategy.sl_buffer_pips:.0f} pip buffer",
                 structure_basis=pending.structure_basis,
             ),

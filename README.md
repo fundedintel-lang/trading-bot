@@ -30,6 +30,14 @@ python main.py dashboard --port 8501       # Streamlit dashboard
 
 Nothing above needs an API key, a network connection or a broker account.
 
+> **What `run` actually trades without credentials.** With no OANDA/Twelve Data
+> keys, `build_feed()` falls back to the deterministic synthetic feed. That feed
+> now advances with the wall clock (new 5M bars appear every 5 minutes and the
+> history is never rewritten), so `python main.py run` behaves like a live
+> session — but the prices are generated, not gold. For a forward test on real
+> prices, create a free **OANDA practice** account and put the token + account id
+> in `.env`; that is the only change needed.
+
 ### CLI
 
 | Command | Purpose |
@@ -259,37 +267,57 @@ structured JSON and human-readable text to console, log, SQLite, Telegram and
 
 ## 9. Measured behaviour (synthetic data)
 
-Reproducible reference run — 90 days of deterministic synthetic gold, ending
-2026-10-07 14:00 UTC:
+Reproducible reference runs — 90 days of deterministic synthetic gold, ending
+2026-10-07 14:00 UTC. Full measurements: [docs/FREQUENCY.md](docs/FREQUENCY.md).
 
 ```bash
 python main.py backtest --days 90 --seed 11 --end 2026-10-07T14:00Z
+python main.py --config configs/high_frequency.yaml backtest --days 90 --seed 11 --end 2026-10-07T14:00Z
 ```
 
-```
-18,443 cycles · 5 trades (3W / 2L) · win rate 60 % · profit factor 2.18
-Net P/L +$147.90 (+1.48 %) · expectancy +$29.58/trade
-Max drawdown $424.81 (4.07 %) · Sharpe 5.25 · Sortino 11.07
-```
+| Profile | Trades | Trades/day | Win rate | Profit factor | Net P/L | Max DD |
+|---|---|---|---|---|---|---|
+| Conservative (`config.yaml`) | 15 | 0.17 | 26.7 % | 0.60 | −$259.26 | 4.52 % |
+| High frequency (`configs/high_frequency.yaml`, 4 × 0.5 %) | 157 | **1.74** | 47.8 % | 0.93 | −$174.66 | 10.07 % |
 
-**Read this correctly.** Five trades is far below the 20-trade minimum the
-report itself flags, the data is synthetic (regime-switching noise, not gold),
-and the sample size makes Sharpe/PF meaningless. What the run does demonstrate
-is that the whole pipeline executes: arming → 5M trigger → validation → risk
-gate → order → partial closes → trailing stop → performance report, with the
-max-two-exposure limit holding (no more than two positions ever open).
+Both runs are far below the 20-trade statistical minimum, the data is synthetic
+(regime-switching noise, not gold), and neither result says anything reliable
+about profitability. What they *do* demonstrate is throughput: the whole
+pipeline executes end to end and the high-frequency profile really does put
+~1.7 orders a day into the market without breaking a single hard law (max 2 %
+exposure, 5 % daily halt, news blackout, spread cap).
 
-Trade frequency is low by design and by data. On this dataset the H4 external
-structure spends most of its time ranging, so `HTF_NOT_ALIGNED` (a hard law)
-rejects the majority of cycles — the same reason the walk-forward folds show
-0–1 trades each. With real XAU/USD history (pass `--csv`) and years of data,
-expect a different and more meaningful distribution. Do not tune thresholds to
-force trades on synthetic noise.
+### Trade frequency is a knob, not a bug
+
+The v1.0 build produced 5 trades in 90 days because five separate defects were
+stacked on top of each other; each is now fixed **and** configurable:
+
+| Defect | Fix | Key |
+|---|---|---|
+| Sweeps only on 5-pip "equal" clusters ($0.50 on gold — almost never forms) | single swing highs/lows are raidable pools too | `strategy.single_swing_lookback_bars` |
+| `HTF_NOT_ALIGNED` demanded 4H *and* 1H agreement — stricter than the law | trade with the 4H during a 1H pullback (`4H_PULLBACK`), and from the correct range half when the 4H ranges (`RANGE`) | `strategy.allow_1h_pullback_alignment`, `strategy.allow_range_alignment` |
+| Entries rested as limits at the zone edge; ~70 % never filled | `entry_mode: MARKET` fills at the 5M trigger, TP1 floored at `min_rr_tp1` | `strategy.entry_mode` |
+| `risk.max_position_age_hours` was never enforced — one position could hold a slot for two days | `TIME_EXIT` time stop implemented | `risk.max_position_age_hours` |
+| Arming required price to already be at the zone | arming radius separated from the trigger radius | `strategy.arm_entry_distance_pips` |
+
+**Do not tune thresholds to manufacture trades on synthetic noise.** Run the
+same commands with `--csv your_xauusd_m5.csv` and 2+ years of real candles
+before drawing any conclusion, and require ≥100 trades per profile.
 
 ## 10. Status & known limitations
 
 * Paper broker and synthetic generator are deterministic — reproducible tests,
-  no claim of realism.
+  no claim of realism. Without broker credentials `run` trades this synthetic
+  feed, not the real market (see §1).
+* Trade frequency is configurable, not fixed. The conservative profile can
+  legitimately produce zero trades in a three-day paper session — that is
+  selectivity, not a stalled engine. `configs/high_frequency.yaml` raises the
+  cadence to ~1.7 trades/day at half size per trade. `python main.py status` and
+  the dashboard's Risk tab show the live rejection counters, so you can always
+  see which gate is binding.
+* Frequency is not the same thing as edge. The high-frequency profile produces
+  13× more trades than the conservative one on the same 90-day sample and still
+  does not demonstrate a positive expectancy. Validate on real data first.
 * The economic-calendar fetch needs outbound network; when it is unavailable the
   filter fails **open** by design (`news.fail_closed: false`) and logs the
   condition. Set `fail_closed: true` to refuse all entries without a calendar.

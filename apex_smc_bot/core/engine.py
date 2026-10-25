@@ -467,10 +467,23 @@ class TradingEngine:
         return ""
 
     def _within_session_window(self, now: datetime, session: Session) -> bool:
-        """Kill zones only: London 07-10 UTC, NY 12-15 UTC (configurable)."""
+        """Is this a window the strategy may arm in?
 
-        if not session.is_kill_zone:
+        Kill zones (London 07-10, NY 12-15 UTC) are always allowed.  With
+        ``sessions.trade_secondary_sessions`` the London afternoon and the
+        London close / NY afternoon are allowed too — they are liquid sessions,
+        unlike the dead zones which the session table already marks
+        non-tradeable.
+        """
+
+        if session.is_kill_zone:
+            return self._time_in_window(now, session)
+        if not self.settings.sessions.trade_secondary_sessions:
             return False
+        return self._time_in_window(now, session)
+
+    @staticmethod
+    def _time_in_window(now: datetime, session: Session) -> bool:
         minutes = now.hour * 60 + now.minute
         start = session.start.hour * 60 + session.start.minute
         end = session.end.hour * 60 + session.end.minute
@@ -502,19 +515,23 @@ class TradingEngine:
                 lookback=self.settings.strategy.ob_lookback_candles,
             )
             fvgs = detect_fvg(list(bars_15m), "M15")
+            price = self._market_price()
+            four_h = self.htf.analyze(h4, "H4", current_price=price)
+            one_h = self.htf.analyze_1h(h1, current_price=price, four_h=four_h)
+            alignment = self.htf.check_alignment(four_h, one_h)
+            # Built *after* the bias so sweeps are graded against the direction
+            # actually being traded (bias=None can only ever yield HIGH/LOW).
             liquidity = build_liquidity_map(
                 list(bars_15m),
                 "M15",
                 tolerance_pips=self.settings.strategy.equal_level_tolerance_pips,
                 internal_lookback=self.settings.strategy.swing_lookback,
                 external_lookback=self.settings.strategy.external_swing_lookback,
+                bias=alignment.direction if alignment.aligned else None,
                 lookahead=self.settings.strategy.sweep_lookahead_candles,
                 pip_size=self.settings.risk.pip_size,
+                single_swing_lookback=self.settings.strategy.single_swing_lookback_bars,
             )
-            price = self._market_price()
-            four_h = self.htf.analyze(h4, "H4", current_price=price)
-            one_h = self.htf.analyze_1h(h1, current_price=price, four_h=four_h)
-            alignment = self.htf.check_alignment(four_h, one_h)
             dealing_range = dealing_range_from_structure(
                 structure,
                 self.settings.strategy.ote_low_fib,
@@ -722,6 +739,7 @@ class TradingEngine:
             order_blocks=order_blocks,
             spread_pips=spread_pips,
             now=now,
+            market_price=price,
         )
         if signal is None:
             report.rejections.append(f"SIGNAL_BUILD:{self.generator.last_rejection or 'unknown'}")

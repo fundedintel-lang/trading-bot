@@ -18,7 +18,7 @@ import math
 import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from apex_smc_bot.data.candle_manager import (
     Candle,
@@ -265,8 +265,14 @@ def load_candles_from_csv(path: str | Path, timeframe: str = "M5") -> list[Candl
 class SyntheticFeed(DataFeed):
     """Offline feed backed by :func:`generate_candles`.
 
-    A fixed ``anchor`` is used for the whole session so repeated polls return a
-    stable, monotonically growing history instead of rewrites.
+    The generator is a strict forward simulation from one fixed ``start``, so a
+    longer run always reproduces the same prefix.  That lets this feed behave
+    like a *live* market: bars keep appearing as the wall clock advances, while
+    everything already delivered stays byte-identical.
+
+    Only closed bars are ever exposed (``timestamp <= last closed M5 bar``), so
+    a caller can never see a candle that has not finished — the same no
+    look-ahead guarantee the replay feed gives a backtest.
     """
 
     name = "synthetic"
@@ -278,29 +284,53 @@ class SyntheticFeed(DataFeed):
         start_price: float = 2350.0,
         volatility: float = 1.8,
         now: datetime | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.days = max(5, days)
         self.seed = seed
         self.start_price = start_price
         self.volatility = volatility
-        self._end = to_utc(now or utcnow())
-        self._m5: list[Candle] | None = None
+        self._clock = clock or utcnow
+        anchor = to_utc(now or self._clock())
+        self._start = floor_to_timeframe(anchor - timedelta(days=self.days), "M5")
+        self._m5: list[Candle] = []
+        self._generated_days = 0
 
-    def _history(self) -> list[Candle]:
-        if self._m5 is None:
-            start = floor_to_timeframe(self._end - timedelta(days=self.days), "M5")
-            self._m5 = generate_candles(
-                start, self.days, "M5", self.seed, self.start_price, self.volatility
-            )
-        return self._m5
+    # ------------------------------------------------------------------ internals
+    def _ensure_horizon(self, now: datetime) -> None:
+        """(Re)generate the series whenever the clock needs bars we do not have.
 
+        The horizon carries one day of slack so regeneration happens roughly
+        once a day instead of on every poll.
+        """
+
+        last_bar = floor_to_timeframe(now, "M5")
+        span = last_bar + timedelta(days=1) - self._start
+        needed = max(1, math.ceil(span.total_seconds() / 86400.0))
+        if self._m5 and needed <= self._generated_days:
+            return
+        self._generated_days = needed
+        self._m5 = generate_candles(
+            self._start, needed, "M5", self.seed, self.start_price, self.volatility
+        )
+
+    def _closed(self) -> list[Candle]:
+        """Closed M5 bars only, newest last."""
+
+        now = to_utc(self._clock())
+        self._ensure_horizon(now)
+        cutoff = floor_to_timeframe(now, "M5")
+        closed = [bar for bar in self._m5 if bar.timestamp < cutoff]
+        return closed or [self._m5[0]]
+
+    # ------------------------------------------------------------------ DataFeed
     async def fetch_candles(self, instrument: str, timeframe: str, count: int) -> list[Candle]:
-        history = self._history()
+        history = self._closed()
         candles = history if timeframe == "M5" else resample(history, timeframe)
         return candles[-count:] if count > 0 else list(candles)
 
     async def fetch_price(self, instrument: str) -> tuple[float, float]:
-        last = self._history()[-1]
+        last = self._closed()[-1]
         half = max(0.05, last.spread) / 2.0
         return round(last.close - half, 2), round(last.close + half, 2)
 

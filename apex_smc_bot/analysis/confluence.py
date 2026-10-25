@@ -67,6 +67,16 @@ class Setup:
     sl_distance_pips: float = 0.0
     sl_structure_based: bool = True
     htf_aligned: bool = False
+    # How the HTF agreement was reached (see HTFBiasEngine.check_alignment):
+    # FULL (4H+1H agree), 4H_PULLBACK (trade with 4H during a 1H pullback),
+    # RANGE (4H ranging, trade the 1H from the correct range half).
+    htf_mode: str = "FULL"
+
+    @property
+    def range_mode(self) -> bool:
+        """True when the setup follows the 1H inside a ranging 4H."""
+
+        return str(self.htf_mode).upper() == "RANGE"
     is_judas: bool = False
 
     @property
@@ -159,6 +169,20 @@ class ConfluenceEngine:
         ):
             breakdown["htf_alignment"] = 1.0
             reasoning.append("✅ 4H + 1H both aligned with trade direction")
+        elif str(setup.htf_mode).upper() == "4H_PULLBACK" and setup.four_h_bias and setup.four_h_bias.direction == setup.direction:
+            # With-trend entry into a 1H pullback: strong, but the 1H is not
+            # confirming, so it earns less than a fully aligned tape.
+            breakdown["htf_alignment"] = 0.7
+            reasoning.append(
+                "◐ 4H trend intact — 1H pullback traded in the 4H direction at a discount"
+            )
+        elif setup.range_mode and setup.one_h_bias and setup.one_h_bias.direction == setup.direction:
+            # Half credit: the 4H has no trend to align with, so the range trade
+            # must earn the rest of its score from the zone, sweep and OTE.
+            breakdown["htf_alignment"] = 0.5
+            reasoning.append(
+                "◐ 4H ranging — 1H direction traded from the correct half of the 4H range"
+            )
 
         # 2) BOS / CHoCH
         if setup.bos_15m and setup.bos_15m.direction == setup.direction:
@@ -268,12 +292,12 @@ class ConfluenceEngine:
         raw_score += sum(p["value"] for p in penalties)
         score = round(min(10.0, max(0.0, raw_score)), 2)
 
-        htf_ok = (
-            setup.four_h_bias is not None
-            and setup.one_h_bias is not None
-            and setup.four_h_bias.direction == setup.direction
-            and setup.one_h_bias.direction == setup.direction
-        )
+        # The hard law is "never trade against the 4H bias".  A 1H that has not
+        # yet turned is a pullback, not a conflict; a ranging 4H has no bias to
+        # violate, so the 1H governs when price is on the correct range half.
+        htf_ok = setup.four_h_bias is not None and setup.four_h_bias.direction == setup.direction
+        if not htf_ok and setup.range_mode:
+            htf_ok = setup.one_h_bias is not None and setup.one_h_bias.direction == setup.direction
         aborted = False
         abort_reason = ""
         required_score = cfg.min_confluence_score
