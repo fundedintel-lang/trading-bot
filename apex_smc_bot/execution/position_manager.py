@@ -225,9 +225,21 @@ class PositionManager:
         hit_stop = market_price <= position.stop_loss if bullish else market_price >= position.stop_loss
         if hit_stop and self.broker.name == "paper":
             fill = min(position.stop_loss, market_price) if bullish else max(position.stop_loss, market_price)
-            pnl = await self._safe_close(position, fill, "STOP_LOSS")
+            # A stop that has been trailed past the entry (or to breakeven) closes
+            # the trade in profit — labelling that STOP_LOSS would make the trade
+            # journal lie about what happened.  The reason is decided *before* the
+            # close so the archived record carries the right label.
+            remaining = (fill - position.entry_price) if bullish else (position.entry_price - fill)
+            projected = round(remaining * position.units, 2)
+            projected_total = round(state.realized + projected, 2)
+            reason = (
+                "STOP_LOSS"
+                if projected_total < 0
+                else ("BREAKEVEN_STOP" if abs(projected_total) < 0.01 else "TRAIL_STOP")
+            )
+            pnl = await self._safe_close(position, fill, reason)
             total = round(state.realized + pnl, 2)
-            self._notify_closed(position, total, "STOP_LOSS")
+            self._notify_closed(position, total, reason)
             self._state.pop(position.trade_id, None)
             events.append(
                 PositionEvent(
@@ -237,7 +249,7 @@ class PositionManager:
                     fill,
                     position.initial_units,
                     pnl,
-                    f"Stop loss hit ({total:+.2f} total)",
+                    f"{reason.replace('_', ' ').title()} ({total:+.2f} total)",
                     now,
                     {"total_pnl": total},
                 )
