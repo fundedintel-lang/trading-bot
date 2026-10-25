@@ -121,8 +121,6 @@ class StrategyConfig:
     opposing_ob_abort_pips: float = 40.0
     min_obstacle_quality: int = 3     # ignore weak opposing blocks when checking the path
     zone_touch_bars: int = 3          # an entry zone counts as "live" for N bars after the touch
-    zone_exit_tolerance_pips: float = 6.0  # price may drift this far past the zone before we skip
-    entry_proximity_pips: float = 12.0     # confirmation is valid this close to the limit entry
     chopbox_lookback: int = 10
     chopbox_max_range_pips: float = 20.0
 

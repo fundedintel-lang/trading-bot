@@ -92,8 +92,6 @@ strategy:
   opposing_ob_abort_pips: 40.0      # veto
   min_obstacle_quality: 3           # weak (<3) opposing blocks are noise on gold
   zone_touch_bars: 3                # an OB/FVG stays "in play" for N five-minute bars
-  zone_exit_tolerance_pips: 6.0     # skip once price has left the zone by more than this
-  entry_proximity_pips: 12.0        # confirmation counts while price is this close to the limit
   chopbox_lookback: 10
   chopbox_max_range_pips: 20.0
 

@@ -154,10 +154,12 @@ NY KZ high 13, NY afternoon low 15, NY close 18.
 ≥3; entry capped at 60 pips from price; premium/discount veto (no buys in
 premium, no sells in discount); OTE 61.8–79 %.
 
-**Trigger (5M, ≥6/7)** — 1 price has traded into the zone within the last 3
-bars and has not been chased, **2** rejection candle, **3** micro-BOS, **4**
-volume/delta, **5** wick ratio, **6** no opposing quality OB within 25/40 pips,
-**7** spread. Checks **1 and 7 are mandatory** — 6/7 without them never fires.
+**Trigger (5M, ≥6/7)** — **1** price traded into the zone within the last 3
+bars (a wick counts: that is what fills a limit order) and the market is not
+already beyond `max_entry_distance_pips` away, **2** rejection candle, **3**
+micro-BOS, **4** volume/delta, **5** wick ratio, **6** no opposing quality OB
+within 25/40 pips, **7** spread. Checks **1 and 7 are mandatory** — 6/7 without
+them never fires, and a stale zone can never confirm a fresh entry.
 
 **Targets** — TP1 1.5R (close 50 %, stop to breakeven), TP2 3R (close 25 %),
 TP3 5R runner with ATR/structure trail.
