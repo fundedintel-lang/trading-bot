@@ -6,24 +6,18 @@ Precedence (low → high):
     3. explicit environment variables for secrets/operational switches
 
 Secrets never live in YAML: they are read from the environment (``.env`` is
-loaded automatically when python-dotenv is installed).
+loaded by the CLI before settings are constructed).
 """
 
 from __future__ import annotations
 
+import math
 import os
-from dataclasses import asdict, dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from datetime import time
 from pathlib import Path
 from typing import Any
-
-try:  # optional dependency, harmless when absent
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except Exception:  # pragma: no cover - dotenv is optional
-    pass
-
 
 class ConfigError(ValueError):
     """Raised when configuration is missing or internally inconsistent."""
@@ -97,6 +91,7 @@ class RiskConfig:
     # because it is old; winners get a hard cap at twice max_position_age_hours.
     time_exit_only_losers: bool = True
     max_position_age_hours: float = 48.0
+    max_cost_to_stop_ratio: float = 0.25  # spread + slippage reserve / stop distance
 
     def __post_init__(self) -> None:
         if self.max_open_trades < 1:
@@ -266,6 +261,8 @@ class FeedConfig:
     request_timeout_seconds: float = 15.0
     max_retries: int = 3
     synthetic_seed: int = 7
+    max_candle_age_seconds: float = 600.0
+    max_quote_age_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -281,7 +278,7 @@ class NewsConfig:
     cache_minutes: int = 30
     block_minutes_before: int = 30
     block_minutes_after: int = 30
-    fail_closed: bool = False  # if calendar unavailable, trade or not
+    fail_closed: bool = True  # no new entries without a usable calendar
     high_impact_keywords: tuple[str, ...] = (
         "FOMC",
         "NFP",
@@ -313,9 +310,32 @@ class BacktestConfig:
 
 
 @dataclass(frozen=True)
+class AIConfig:
+    """Optional second opinion, never an order generator or risk authority."""
+
+    enabled: bool = False
+    provider: str = "groq"  # groq | xai (Grok)
+    model: str = ""        # blank selects the provider default below
+    mode: str = "advisory"  # advisory | veto
+    timeout_seconds: float = 8.0
+    max_tokens: int = 400
+    max_calls_per_day: int = 100
+    cache_ttl_seconds: float = 60.0
+    failure_cooldown_seconds: float = 60.0
+    min_confidence: float = 0.65
+    fail_closed: bool = True  # applies only in veto mode
+
+    @property
+    def model_name(self) -> str:
+        return self.model or {"groq": "llama-3.3-70b-versatile", "xai": "grok-3-mini"}.get(self.provider, "")
+
+
+@dataclass(frozen=True, repr=False)
 class Secrets:
     """Runtime credentials — env only, never serialised into logs."""
 
+    groq_api_key: str = ""
+    xai_api_key: str = ""
     oanda_account_id: str = ""
     oanda_access_token: str = ""
     telegram_bot_token: str = ""
@@ -332,15 +352,19 @@ class Secrets:
     email_to: str = ""
 
     @classmethod
-    def from_env(cls) -> "Secrets":
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "Secrets":
+        environ = os.environ if environ is None else environ
+
         def env(name: str, default: str = "") -> str:
-            return os.environ.get(name, default).strip()
+            return environ.get(name, default).strip()
 
         try:
             smtp_port = int(env("SMTP_PORT", "587") or 587)
         except ValueError:
             smtp_port = 587
         return cls(
+            groq_api_key=env("GROQ_API_KEY"),
+            xai_api_key=env("XAI_API_KEY"),
             oanda_account_id=env("OANDA_ACCOUNT_ID"),
             oanda_access_token=env("OANDA_ACCESS_TOKEN"),
             telegram_bot_token=env("TELEGRAM_BOT_TOKEN"),
@@ -369,6 +393,8 @@ class Secrets:
         """Safe representation for logs/health checks."""
 
         return {
+            "groq_configured": bool(self.groq_api_key),
+            "xai_configured": bool(self.xai_api_key),
             "oanda_configured": self.has_oanda,
             "telegram_configured": self.has_telegram,
             "discord_configured": bool(self.discord_webhook_url),
@@ -376,6 +402,10 @@ class Secrets:
             "mt5_configured": bool(self.mt5_login),
             "smtp_configured": bool(self.smtp_host),
         }
+
+
+    def __repr__(self) -> str:
+        return f"Secrets(configured={self.redacted()!r})"
 
 
 @dataclass(frozen=True)
@@ -391,7 +421,9 @@ class Settings:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     news: NewsConfig = field(default_factory=NewsConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
-    secrets: Secrets = field(default_factory=Secrets)
+    ai: AIConfig = field(default_factory=AIConfig)
+    secrets: Secrets = field(default_factory=Secrets, repr=False)
+    live_trading_confirmed: bool = False  # environment-only third interlock
     project_root: str = "."
 
     # ------------------------------------------------------------------ loading
@@ -426,6 +458,12 @@ class Settings:
 
     @classmethod
     def _from_dict(cls, raw: dict[str, Any], environ: dict[str, str]) -> "Settings":
+        allowed_sections = {"bot", "execution", "risk", "strategy", "sessions", "notifications",
+                            "logging", "feed", "database", "news", "backtest", "ai"}
+        unknown = set(raw) - allowed_sections
+        if unknown:
+            raise ConfigError(f"Unknown config sections: {sorted(unknown)}; secrets belong in the environment")
+
         def section(name: str) -> dict[str, Any]:
             value = raw.get(name) or {}
             if not isinstance(value, dict):
@@ -434,6 +472,7 @@ class Settings:
 
         def build(factory: Any, values: dict[str, Any], cast: dict[str, Any] | None = None) -> Any:
             allowed = factory.__dataclass_fields__  # type: ignore[attr-defined]
+            defaults = factory()
             kwargs: dict[str, Any] = {}
             cast = cast or {}
             for key, value in values.items():
@@ -441,6 +480,14 @@ class Settings:
                     raise ConfigError(f"Unknown config key {key!r} for {factory.__name__}")
                 if key in cast:
                     value = cast[key](value)
+                default = getattr(defaults, key)
+                if isinstance(default, bool) and not isinstance(value, bool):
+                    raise ConfigError(f"{factory.__name__}.{key} must be a YAML boolean")
+                if isinstance(default, (int, float)) and not isinstance(default, bool):
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                        raise ConfigError(f"{factory.__name__}.{key} must be a finite number")
+                    if isinstance(default, int) and not isinstance(value, int):
+                        raise ConfigError(f"{factory.__name__}.{key} must be an integer")
                 kwargs[key] = value
             return factory(**kwargs)
 
@@ -473,36 +520,48 @@ class Settings:
                 database=build(DatabaseConfig, section("database")),
                 news=build(NewsConfig, news_raw),
                 backtest=build(BacktestConfig, section("backtest")),
+                ai=build(AIConfig, section("ai")),
                 project_root=str(Path.cwd()),
             )
         except TypeError as exc:  # dataclass constructor mismatch
             raise ConfigError(str(exc)) from exc
 
-        # Environment overrides for operational, non-secret switches.
-        overrides: dict[str, Any] = {}
-        if environ.get("APEX_EXECUTION_MODE"):
-            overrides["execution_mode"] = environ["APEX_EXECUTION_MODE"].upper()
-        if environ.get("APEX_ALLOW_LIVE", "").lower() in {"1", "true", "yes"}:
-            overrides["allow_live"] = True
-        if overrides.get("execution_mode") or overrides.get("allow_live"):
-            execution = settings.execution
-            if "execution_mode" in overrides:
-                settings = cls(**{**asdict_shallow(settings), "bot": BotConfig(
-                    **{**asdict_shallow(settings.bot), "execution_mode": overrides["execution_mode"]}
-                )})
-            if overrides.get("allow_live"):
-                settings = cls(**{**asdict_shallow(settings), "execution": ExecutionConfig(
-                    **{**asdict_shallow(settings.execution), "allow_live_trading": True}
-                )})
-        # Secrets are always read from the environment.
-        settings = cls(**{**asdict_shallow(settings), "secrets": Secrets.from_env()})
-        return settings
+        def env_bool(name: str, default: bool = False) -> bool:
+            if name not in environ:
+                return default
+            value = environ[name].strip().lower()
+            if value not in {"1", "true", "yes", "0", "false", "no"}:
+                raise ConfigError(f"{name} must be true or false")
+            return value in {"1", "true", "yes"}
+
+        # The environment cannot turn on the YAML live switch: BOTH are required.
+        bot = replace(settings.bot, execution_mode=environ.get("APEX_EXECUTION_MODE", settings.bot.execution_mode).upper())
+        ai = replace(
+            settings.ai,
+            enabled=env_bool("APEX_AI_ENABLED", settings.ai.enabled),
+            provider=environ.get("APEX_AI_PROVIDER", settings.ai.provider).strip().lower(),
+            model=environ.get("APEX_AI_MODEL", settings.ai.model).strip(),
+            mode=environ.get("APEX_AI_MODE", settings.ai.mode).strip().lower(),
+        )
+        return replace(settings, bot=bot, ai=ai, secrets=Secrets.from_env(environ),
+                       live_trading_confirmed=env_bool("APEX_ALLOW_LIVE"))
 
     # ------------------------------------------------------------------ helpers
     def validate(self) -> None:
         """Raise ``ConfigError`` when values are inconsistent or unsafe."""
 
         risk, strategy = self.risk, self.strategy
+        # Also validate directly constructed settings (tests and library callers).
+        for section in (self.risk, self.strategy, self.execution, self.feed, self.backtest, self.ai,
+                        self.news, self.notifications, self.database, self.sessions):
+            for key, value in asdict_shallow(section).items():
+                default = section.__dataclass_fields__[key].default
+                if isinstance(default, bool) and not isinstance(value, bool):
+                    raise ConfigError(f"{type(section).__name__}.{key} must be boolean")
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(value):
+                    raise ConfigError(f"{type(section).__name__}.{key} must be finite")
+        if not isinstance(self.live_trading_confirmed, bool):
+            raise ConfigError("live_trading_confirmed must be boolean")
         if not 0 < risk.max_risk_per_trade_percent <= 2.0:
             raise ConfigError("risk.max_risk_per_trade_percent must be within (0, 2]")
         if not 0 < risk.max_daily_loss_percent <= 20:
@@ -515,16 +574,30 @@ class Settings:
             raise ConfigError("execution.broker must be 'paper' or 'oanda'")
         if self.execution.oanda_environment not in {"practice", "live"}:
             raise ConfigError("execution.oanda_environment must be 'practice' or 'live'")
-        if self.execution.oanda_environment == "live" and not self.execution.allow_live_trading:
-            raise ConfigError(
-                "Live OANDA environment requested but execution.allow_live_trading is false"
-            )
+        if self.execution.broker == "oanda" and self.execution.oanda_environment == "live":
+            if not self.execution.allow_live_trading or not self.live_trading_confirmed:
+                raise ConfigError("Live OANDA requires BOTH execution.allow_live_trading: true and APEX_ALLOW_LIVE=true")
+        if self.execution.broker == "oanda" and self.feed.primary == "synthetic":
+            raise ConfigError("Synthetic prices must never drive an OANDA account")
         if risk.max_sl_pips <= risk.min_sl_pips:
             raise ConfigError("risk.max_sl_pips must be greater than min_sl_pips")
         if risk.min_lot <= 0 or risk.max_lot < risk.min_lot:
             raise ConfigError("Lot limits are invalid")
         if risk.pip_size <= 0 or risk.pip_value_per_lot <= 0:
             raise ConfigError("pip_size and pip_value_per_lot must be positive")
+        if risk.contract_size <= 0 or not math.isclose(risk.pip_value_per_lot, risk.pip_size * risk.contract_size):
+            raise ConfigError("pip_value_per_lot must equal pip_size * contract_size for USD-quoted sizing")
+        if not 0 < risk.max_cost_to_stop_ratio <= 1:
+            raise ConfigError("risk.max_cost_to_stop_ratio must be within (0, 1]")
+        if risk.min_sl_pips <= 0 or risk.max_slippage_pips < 0 or risk.max_spread_pips <= 0:
+            raise ConfigError("Stop/spread limits must be positive and slippage non-negative")
+        if not 0 < risk.reduce_risk_threshold_percent < risk.max_daily_loss_percent:
+            raise ConfigError("Reduced-risk drawdown threshold must be below the daily halt")
+        if self.execution.pending_order_ttl_minutes <= 0 or self.execution.paper_starting_equity <= 0:
+            raise ConfigError("Pending order TTL and paper equity must be positive")
+        if self.feed.max_quote_age_seconds <= 0 or self.feed.max_candle_age_seconds <= 0:
+            raise ConfigError("Feed freshness limits must be positive")
+
         if not 0 < strategy.ote_low_fib < strategy.ote_high_fib < 1:
             raise ConfigError("OTE Fibonacci bounds must satisfy 0 < low < high < 1")
         if not 0 <= strategy.min_confluence_score <= 10:
@@ -535,6 +608,23 @@ class Settings:
             raise ConfigError("strategy.max_entry_distance_pips must be positive")
         if self.feed.historical_bars < 250:
             raise ConfigError("feed.historical_bars must be at least 250 for HTF analysis")
+        if not (0 < strategy.tp1_close_fraction < 1 and 0 < strategy.tp2_close_fraction < 1
+                and strategy.tp1_close_fraction + strategy.tp2_close_fraction < 1):
+            raise ConfigError("TP fractions must be positive and leave a runner (sum < 1)")
+        if not 0 < strategy.min_rr_tp1 < strategy.min_rr_tp2 <= strategy.target_rr_tp3:
+            raise ConfigError("Target R multiples must increase: TP1 < TP2 <= TP3")
+        if self.ai.provider not in {"groq", "xai"} or self.ai.mode not in {"advisory", "veto"}:
+            raise ConfigError("ai.provider must be groq or xai; ai.mode must be advisory or veto")
+        if not 0 <= self.ai.min_confidence <= 1 or not 0 < self.ai.timeout_seconds <= 30:
+            raise ConfigError("AI confidence must be in [0, 1] and timeout in (0, 30]")
+        if not 32 <= self.ai.max_tokens <= 2000 or self.ai.max_calls_per_day < 1:
+            raise ConfigError("AI token limit must be 32–2000 and daily call limit positive")
+        if self.ai.cache_ttl_seconds < 0 or self.ai.failure_cooldown_seconds <= 0:
+            raise ConfigError("AI cache TTL must be non-negative and cooldown positive")
+        if self.backtest.days < 1 or self.backtest.initial_equity <= 0:
+            raise ConfigError("Backtest days and equity must be positive")
+        if min(self.backtest.spread_pips, self.backtest.slippage_pips, self.backtest.commission_per_lot) < 0:
+            raise ConfigError("Backtest costs cannot be negative")
         if self.database.enabled and not self.database.path:
             raise ConfigError("database.path is required when database.enabled is true")
 

@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
 
-from apex_smc_bot.config import Settings
+from apex_smc_bot.config import Secrets, Settings
 from apex_smc_bot.data.synthetic import SyntheticFeed, generate_market_data
 from apex_smc_bot.execution.paper_broker import PaperBroker
 from apex_smc_bot.logging_setup import setup_logging
@@ -25,6 +25,10 @@ def _check(name: str, ok: bool, detail: str = "") -> tuple[str, bool, str]:
 def run_selftest(settings: Settings) -> int:
     """Execute every layer offline and print a pass/fail table."""
 
+    settings = replace(settings, ai=replace(settings.ai, enabled=False),
+                       news=replace(settings.news, enabled=False), secrets=Secrets(),
+                       execution=replace(settings.execution, broker="paper", oanda_environment="practice", allow_live_trading=False),
+                       notifications=replace(settings.notifications, telegram_enabled=False, discord_enabled=False, email_enabled=False))
     results: list[tuple[str, bool, str]] = []
     data = generate_market_data(days=30, seed=settings.feed.synthetic_seed)
     results.append(

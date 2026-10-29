@@ -154,8 +154,12 @@ class NewsFilter:
                     continue
             if events:
                 self._events = sorted(events, key=lambda event: event.timestamp)
-                self._last_fetch = utcnow()
-                self._last_attempt = self._last_fetch
+                saved_fetch = self.database.get_runtime_state("news_cache_fetched_at")
+                if saved_fetch:
+                    self._last_fetch = to_utc(datetime.fromisoformat(str(saved_fetch)))
+                    self._last_attempt = self._last_fetch
+                # Old cache formats without a fetch timestamp must refresh;
+                # restarting cannot make an old calendar appear newly fetched.
         except Exception:  # noqa: BLE001
             pass
 
@@ -163,6 +167,7 @@ class NewsFilter:
         if self.database is None:
             return
         try:
+            self.database.set_runtime_state("news_cache_fetched_at", self._last_fetch.isoformat() if self._last_fetch else None)
             self.database.set_runtime_state(
                 "news_events_cache",
                 [
@@ -286,14 +291,15 @@ class NewsFilter:
         ]
         next_event = min(upcoming, key=lambda event: event.timestamp) if upcoming else None
         age = self.cache_age_minutes(now)
-        stale = age is None or age > self.config.cache_minutes * 1.5
+        stale = age is None or age < 0 or age > self.config.cache_minutes * 1.5
         error = self._error
-        if stale and not self._events:
-            # No calendar at all: fail-open unless explicitly configured closed.
-            safe = not self.config.fail_closed
-            source = "unavailable"
+        if stale:
+            # A non-empty but expired calendar is not permission to trade.
+            # Even fail-open must respect any known event blackout.
+            safe = not self.config.fail_closed and not blocking
+            source = "unavailable" if self.config.fail_closed or not self._events else "cache"
             if not error:
-                error = "calendar not available"
+                error = "calendar missing or stale"
         else:
             safe = not blocking
             source = "cache" if stale else "live"

@@ -14,8 +14,7 @@ approval flow.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -29,7 +28,6 @@ from apex_smc_bot.dashboard.chart_renderer import (
     equity_curve_chart,
     score_histogram,
 )
-from apex_smc_bot.data.candle_manager import to_utc
 from apex_smc_bot.data.database import Database
 
 st.set_page_config(page_title="APEX-SMC · XAU/USD", page_icon="🏆", layout="wide")
@@ -133,8 +131,8 @@ def render_header() -> None:
     cols[1].metric("Daily DD", f"{daily_dd:.2f}%", delta=f"-{daily_dd:.2f}%" if daily_dd else None, delta_color="inverse")
     limit = float(settings.risk.max_daily_loss_percent)
     cols[2].metric("DD limit", f"{limit:.1f}%")
-    cols[3].metric("Open trades", str(state.get("engine_counters", {}).get("signals", "—"))
-                   if isinstance(state.get("engine_counters"), dict) else "—")
+    trades = load_trades()
+    cols[3].metric("Open trades", int((trades["status"] == "OPEN").sum()) if not trades.empty else 0)
     cols[4].metric("Risk / trade", f"{settings.risk.max_risk_per_trade_percent:.2f}%")
     if daily_dd >= limit * 0.6:
         st.warning(f"Daily drawdown at {daily_dd:.2f}% — circuit breaker trips at {limit:.1f}%.")
@@ -177,7 +175,7 @@ def render_chart() -> None:
             }
             take_profit = row["take_profit"] if "take_profit" in active.columns else None
             if take_profit is not None and pd.notna(take_profit):
-                levels["tp2"] = float(take_profit)
+                levels["tp3"] = float(take_profit)
     figure = candlestick_chart(bars, title=f"XAU/USD · {timeframe}", levels=levels)
     st.plotly_chart(figure, use_container_width=True)
 
@@ -295,10 +293,27 @@ def render_risk() -> None:
         st.json(news or [])
 
 
+def render_ai() -> None:
+    settings = get_settings()
+    st.subheader("AI second opinion")
+    st.caption("The strategy and risk limits remain authoritative. Model confidence is NOT a win probability.")
+    st.json({"enabled": settings.ai.enabled, "provider": settings.ai.provider,
+             "model": settings.ai.model_name, "mode": settings.ai.mode,
+             "configured": bool(settings.secrets.groq_api_key if settings.ai.provider == "groq" else settings.secrets.xai_api_key),
+             "daily_request_budget": settings.ai.max_calls_per_day,
+             "usage": get_database().get_runtime_state("ai_daily_budget", {})})
+    reviews = get_database().get_events("AI_REVIEW", limit=30)
+    if not reviews:
+        st.info("No AI reviews yet. Requests happen only after a deterministic signal passes its gates; replay never calls AI.")
+    else:
+        st.dataframe([{"timestamp": row["timestamp"], **row["payload"]} for row in reviews],
+                     use_container_width=True)
+
+
 def main() -> None:
     settings = get_settings()
     render_header()
-    tabs = st.tabs(["Chart", "Signals", "Performance", "Positions", "Risk", "Config"])
+    tabs = st.tabs(["Chart", "Signals", "Performance", "Positions", "Risk", "AI Review", "Config"])
     with tabs[0]:
         render_chart()
     with tabs[1]:
@@ -310,6 +325,8 @@ def main() -> None:
     with tabs[4]:
         render_risk()
     with tabs[5]:
+        render_ai()
+    with tabs[6]:
         public = settings.public_dict()
         st.json(public)
         st.caption(f"Database: {settings.database_path} · logs: {settings.logs_dir}")

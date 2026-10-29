@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -14,7 +13,7 @@ from apex_smc_bot.execution.order_manager import OrderManager
 from apex_smc_bot.execution.paper_broker import PaperBroker
 from apex_smc_bot.execution.position_manager import PositionManager
 from apex_smc_bot.execution.trail_stop import next_stop
-from apex_smc_bot.signals.models import BEARISH, BULLISH
+from apex_smc_bot.signals.models import BEARISH
 from apex_smc_bot.tests.factories import make_signal
 
 T0 = datetime(2026, 10, 7, 13, 0, tzinfo=timezone.utc)
@@ -205,6 +204,8 @@ async def test_semi_auto_queues_then_approves():
     assert orders.get_pending_approvals()
     approved = await orders.approve(signal.signal_id, 2350.0, 0.20, T0)
     assert approved.success
+    # A sell limit requires the BID to touch, not just the midpoint.
+    await broker.mark_price(2350.2, 0.20, T0 + timedelta(seconds=1))
     assert broker.get_open_positions()
 
 
@@ -267,6 +268,7 @@ async def test_profitable_stop_is_labelled_a_trail_not_a_loss():
     broker = PaperBroker(starting_equity=10_000, slippage_price=0.0)
     await broker.mark_price(2350.0, 0.20, T0)
     await broker.submit_order(_request(units=40), 2350.0, 0.0)
+    await broker.mark_price(2344.0, 0.0, T0 + timedelta(minutes=25))
     await broker.modify_stop(broker.get_open_positions()[0].trade_id, 2345.0)
     manager = PositionManager(settings, broker)
     events = await manager.on_price(2346.0, 0.0, [], T0 + timedelta(minutes=30))

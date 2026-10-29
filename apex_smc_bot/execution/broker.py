@@ -14,6 +14,10 @@ class BrokerError(RuntimeError):
     """Broker rejected or failed an operation."""
 
 
+class BrokerOutcomeUnknown(BrokerError):
+    """A write may have reached the broker; reconcile, never blindly retry."""
+
+
 class BrokerNotConfigured(BrokerError):
     """Credentials/SDK missing — execution cannot proceed."""
 

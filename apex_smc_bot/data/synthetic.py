@@ -18,7 +18,7 @@ import math
 import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 from apex_smc_bot.data.candle_manager import (
     Candle,
@@ -257,6 +257,12 @@ def load_candles_from_csv(path: str | Path, timeframe: str = "M5") -> list[Candl
     if not candles:
         raise ValueError("CSV contains no candles")
     candles.sort(key=lambda c: c.timestamp)
+    if len({c.timestamp for c in candles}) != len(candles):
+        raise ValueError("CSV contains duplicate candle timestamps")
+    if any(c.low <= 0 for c in candles):
+        raise ValueError("CSV prices must be positive")
+    if any(c.timestamp != floor_to_timeframe(c.timestamp, "M5") for c in candles):
+        raise ValueError("CSV timestamps must be M5 bar-open boundaries (UTC)")
     if timeframe != "M5":
         candles = resample(candles, timeframe)
     return candles
@@ -321,12 +327,14 @@ class SyntheticFeed(DataFeed):
         self._ensure_horizon(now)
         cutoff = floor_to_timeframe(now, "M5")
         closed = [bar for bar in self._m5 if bar.timestamp < cutoff]
-        return closed or [self._m5[0]]
+        return closed
 
     # ------------------------------------------------------------------ DataFeed
     async def fetch_candles(self, instrument: str, timeframe: str, count: int) -> list[Candle]:
         history = self._closed()
         candles = history if timeframe == "M5" else resample(history, timeframe)
+        cutoff = to_utc(self._clock()) - timedelta(seconds=TIMEFRAME_SECONDS[timeframe])
+        candles = [bar for bar in candles if bar.timestamp <= cutoff]
         return candles[-count:] if count > 0 else list(candles)
 
     async def fetch_price(self, instrument: str) -> tuple[float, float]:

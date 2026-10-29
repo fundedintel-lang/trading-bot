@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Iterable
 
 from apex_smc_bot.data.candle_manager import to_utc, utcnow
@@ -115,6 +115,7 @@ class StateManager:
         self._ledger: dict[str, LedgerEntry] = {}
         self.counters = EngineCounters()
         self._paused = False
+        self._last_equity: float | None = None
         self._loaded = False
         self.load()
 
@@ -252,6 +253,7 @@ class StateManager:
 
     # ------------------------------------------------------------------ equity
     def set_last_equity(self, equity: float) -> None:
+        self._last_equity = float(equity)
         if self.database is not None:
             try:
                 self.database.set_runtime_state(EQUITY_KEY, float(equity))
@@ -259,12 +261,17 @@ class StateManager:
                 pass
 
     def last_equity(self, default: float = 0.0) -> float:
-        if self.database is None:
-            return default
-        try:
-            return float(self.database.get_runtime_state(EQUITY_KEY, default) or default)
-        except Exception:  # noqa: BLE001
-            return default
+        if self._last_equity is not None:
+            return self._last_equity
+        if self.database is not None:
+            try:
+                value = self.database.get_runtime_state(EQUITY_KEY)
+                if value is not None:
+                    self._last_equity = float(value)
+                    return self._last_equity
+            except Exception:  # noqa: BLE001
+                pass
+        return default
 
     # ------------------------------------------------------------------ counters
     def tick_cycle(self, now: datetime | None = None) -> None:

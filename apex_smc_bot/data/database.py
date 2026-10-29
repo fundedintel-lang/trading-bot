@@ -326,7 +326,7 @@ class Database:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(trade_id) DO UPDATE SET
                          status=excluded.status, stop_loss=excluded.stop_loss,
-                         take_profit=excluded.take_profit, closed_at=excluded.closed_at,
+                         take_profit=excluded.take_profit, units=excluded.units, closed_at=excluded.closed_at,
                          realized_pnl=excluded.realized_pnl, payload=excluded.payload""",
                     (
                         trade["trade_id"],

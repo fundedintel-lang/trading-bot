@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 from apex_smc_bot.analysis.candle_psych import CandleAnalysis
 from apex_smc_bot.analysis.order_blocks import OrderBlock
@@ -96,7 +95,7 @@ def make_signal(
     bullish = direction == BULLISH
     sl_distance = abs(entry - stop_loss)
     sl_pips = round(sl_distance / 0.10, 1)
-    risk_amount = equity * risk_percent / 100.0
+    risk_amount = lots * sl_pips * 10.0  # actual floor-rounded stop exposure, not the budget
     if tp1 is None:
         tp1 = entry + (1.5 * sl_distance if bullish else -1.5 * sl_distance)
     if tp2 is None:

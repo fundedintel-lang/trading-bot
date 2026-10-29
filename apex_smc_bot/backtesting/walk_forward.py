@@ -140,6 +140,7 @@ class WalkForwardAnalyzer:
             initial_equity=self.settings.backtest.initial_equity,
             spread_pips=self.settings.backtest.spread_pips,
             slippage_pips=self.settings.backtest.slippage_pips,
+            commission_per_lot=self.settings.backtest.commission_per_lot,
             risk_percent=self.settings.backtest.risk_percent,
             seed=self.seed,
             data_csv=self.data_csv,
@@ -153,7 +154,8 @@ class WalkForwardAnalyzer:
         m5 = dataset["M5"]
         if not m5:
             raise ValueError("No data for walk-forward analysis")
-        first, last = m5[0].timestamp, m5[-1].timestamp
+        last = min(self.end, m5[-1].timestamp + timedelta(minutes=5))
+        first = max(m5[0].timestamp, last - timedelta(days=self.days))
         span = (last - first) / self.folds
         folds: list[WalkForwardFold] = []
         oos_trades: list[dict[str, Any]] = []
@@ -161,9 +163,10 @@ class WalkForwardAnalyzer:
         for index in range(self.folds):
             fold_start = first + span * index
             is_start = fold_start
-            is_end = min(is_start + timedelta(days=self.is_days), last)
+            fold_end = first + span * (index + 1)
+            is_end = min(is_start + timedelta(days=self.is_days), fold_end)
             oos_start = is_end
-            oos_end = min(oos_start + timedelta(days=self.oos_days), last)
+            oos_end = min(oos_start + timedelta(days=self.oos_days), fold_end)
             if oos_end <= oos_start:
                 continue
 
@@ -190,11 +193,15 @@ class WalkForwardAnalyzer:
             initial_equity=self.settings.backtest.initial_equity,
             min_trades_for_report=self.settings.backtest.min_trades_for_report,
         )
+        combined.notes.append("OOS folds reset capital independently; combined curve is trade-P/L aggregation, not one compounded account or intrabar OOS drawdown.")
         return WalkForwardResult(
             folds=folds,
             combined_oos=combined,
             settings_summary={
                 "instrument": self.settings.bot.instrument,
+                "data_source": "csv" if self.data_csv else "synthetic",
+                "ai_enabled": False,
+                "news_enabled": False,
                 "confluence_min": self.settings.strategy.min_confluence_score,
                 "five_m_checks": self.settings.strategy.min_fivem_checks,
                 "risk_percent": self.settings.risk.max_risk_per_trade_percent,
@@ -213,25 +220,13 @@ class WalkForwardAnalyzer:
         config.start = start
         config.end = end
         config.days = max(1, (end - start).days)
-        engine = BacktestEngine(self.settings, config)
-        # Feed the pre-loaded dataset through a temporary cache so each fold does
-        # not regenerate (or reload CSV) data.
-        original_loader = engine.run
-        try:
-            return await self._run_with_dataset(engine, dataset)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  fold window {start:%Y-%m-%d} → {end:%Y-%m-%d} failed: {exc}", flush=True)
-            return None
-
-    async def _run_with_dataset(self, engine: BacktestEngine, dataset: dict[str, Any]) -> BacktestResult:
-        import apex_smc_bot.backtesting.backtest_engine as module
-
-        original = module.load_dataset
-        module.load_dataset = lambda config: dataset  # type: ignore[assignment]
-        try:
-            return await engine.run()
-        finally:
-            module.load_dataset = original  # type: ignore[assignment]
+        # Dataset injection is local: never monkey-patch a module-global loader
+        # (concurrent folds previously could replay each other's data).
+        engine = BacktestEngine(self.settings, config, dataset=dataset)
+        result = await engine.run()
+        if not result.ok:
+            raise RuntimeError(f"Walk-forward window {start.isoformat()} had cycle errors")
+        return result
 
     def run_sync(self) -> WalkForwardResult:
         return asyncio.run(self.run())

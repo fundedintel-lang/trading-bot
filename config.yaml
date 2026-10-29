@@ -61,6 +61,7 @@ risk:
   max_position_age_hours: 48.0
   breakeven_after_tp1: true         # spec default; false lets the 3R/5R runner breathe
   time_exit_only_losers: true       # stale winners get 2x the age cap, then close
+  max_cost_to_stop_ratio: 0.25      # reject entries dominated by spread + slippage reserve
 
 # ----------------------------------------------------------------------------
 # Strategy
@@ -156,6 +157,8 @@ feed:
   request_timeout_seconds: 15.0
   max_retries: 3
   synthetic_seed: 7
+  max_candle_age_seconds: 600.0     # age measured from last M5 close
+  max_quote_age_seconds: 30.0
 
 # ----------------------------------------------------------------------------
 # Database
@@ -173,7 +176,7 @@ news:
   cache_minutes: 30
   block_minutes_before: 30
   block_minutes_after: 30
-  fail_closed: false            # true = stop trading when the calendar is unreachable
+  fail_closed: true             # no new entries without a usable calendar
   high_impact_keywords:
     - FOMC
     - NFP
@@ -197,8 +200,26 @@ backtest:
   initial_equity: 10000.0
   spread_pips: 2.0
   slippage_pips: 0.5
-  commission_per_lot: 0.0
+  commission_per_lot: 0.0       # USD per lot PER SIDE; enter your actual broker fee
   risk_percent: 1.0
   seed: 42
   data_csv: null
   min_trades_for_report: 20
+
+# ----------------------------------------------------------------------------
+# Optional AI review — Groq and xAI/Grok are DIFFERENT providers.
+# Credentials belong only in .env: GROQ_API_KEY or XAI_API_KEY.
+# Never activates live trading. Never creates orders or raises risk.
+# ----------------------------------------------------------------------------
+ai:
+  enabled: false
+  provider: groq                  # groq | xai (Grok)
+  model: ""                      # blank: llama-3.3-70b-versatile / grok-3-mini
+  mode: advisory                  # advisory | veto; start with advisory in paper mode
+  timeout_seconds: 8.0
+  max_tokens: 400
+  max_calls_per_day: 100           # persisted UTC-day request budget, not a dollar cap
+  cache_ttl_seconds: 60.0
+  failure_cooldown_seconds: 60.0
+  min_confidence: 0.65             # review certainty, NOT a probability of profit
+  fail_closed: true               # veto mode only: outage / missing key blocks entries

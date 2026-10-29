@@ -8,6 +8,8 @@ and portfolio checks live in :mod:`apex_smc_bot.risk.risk_engine`.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -15,7 +17,7 @@ from typing import Any
 from apex_smc_bot.config import Settings
 from apex_smc_bot.data.candle_manager import to_utc, utcnow
 from apex_smc_bot.execution.lot_calculator import sl_distance_pips
-from apex_smc_bot.signals.models import Signal
+from apex_smc_bot.signals.models import BEARISH, BULLISH, Signal
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,28 @@ class SignalValidator:
         def warn(code: str, message: str) -> None:
             warnings.append(ValidationIssue(code, message, "WARNING"))
 
+        sizing = signal.position_sizing
+        numbers = [entry, sl, signal.confluence_score, signal.confidence_percent,
+                   sizing.account_equity, sizing.risk_percent, sizing.risk_amount_usd,
+                   sizing.lot_size, sizing.units, sizing.sl_pips, sizing.cost_reserve_pips,
+                   sizing.contract_size, sizing.pip_value_per_lot,
+                   signal.risk_reward.rr_to_tp1, signal.risk_reward.rr_to_tp2,
+                   *signal.take_profits.all_levels()]
+        checks["finite_values"] = all(
+            isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+            for value in numbers
+        )
+        if not checks["finite_values"]:
+            fail("NON_FINITE_SIGNAL", "All trade prices and sizing fields must be finite numbers")
+            return ValidationResult(False, errors, warnings, checks)
+        checks["direction_valid"] = signal.direction in {BULLISH, BEARISH}
+        checks["instrument_valid"] = signal.instrument == self.settings.bot.instrument
+        checks["entry_type_valid"] = signal.entry.type in {"MARKET", "LIMIT"}
+        checks["positive_prices"] = all(value > 0 for value in [entry, sl, *signal.take_profits.all_levels()])
+        for key in ("direction_valid", "instrument_valid", "entry_type_valid", "positive_prices"):
+            if not checks[key]:
+                fail(key.upper(), f"Invalid trade plan: {key}")
+
         # 1) Direction & stop placement ---------------------------------------
         checks["stop_on_correct_side"] = sl < entry if bullish else sl > entry
         if not checks["stop_on_correct_side"]:
@@ -113,22 +137,21 @@ class SignalValidator:
         risk_distance = abs(entry - sl)
         computed_rr = abs(tp1 - entry) / risk_distance if risk_distance > 0 else 0.0
         quoted_rr = signal.risk_reward.rr_to_tp1
-        checks["rr_matches_prices"] = abs(computed_rr - quoted_rr) <= max(0.15, quoted_rr * 0.1)
+        checks["rr_matches_prices"] = abs(computed_rr - quoted_rr) <= 0.02
         if not checks["rr_matches_prices"]:
             fail(
                 "RR_MISMATCH",
                 f"Quoted TP1 R:R {quoted_rr:.2f} does not match the levels ({computed_rr:.2f})",
             )
 
-        checks["tp1_min_rr"] = signal.risk_reward.rr_to_tp1 >= min(1.0, self.strategy.min_rr_tp1)
+        checks["tp1_min_rr"] = computed_rr + 0.01 >= self.strategy.min_rr_tp1
         if not checks["tp1_min_rr"]:
-            fail("TP1_RR_TOO_LOW", f"TP1 R:R {signal.risk_reward.rr_to_tp1:.2f} < 1.0")
-        elif signal.risk_reward.rr_to_tp1 < self.strategy.min_rr_tp1:
-            warn(
-                "TP1_RR_BELOW_TARGET",
-                f"TP1 R:R {signal.risk_reward.rr_to_tp1:.2f} below configured minimum "
-                f"{self.strategy.min_rr_tp1}",
-            )
+            fail("TP1_RR_TOO_LOW", f"Computed TP1 R:R {computed_rr:.2f} < {self.strategy.min_rr_tp1}")
+        computed_rr2 = abs(signal.take_profits.tp2.price - entry) / risk_distance if risk_distance else 0.0
+        checks["tp2_min_rr"] = computed_rr2 + 0.01 >= self.strategy.min_rr_tp2
+        checks["tp2_rr_matches_prices"] = abs(computed_rr2 - signal.risk_reward.rr_to_tp2) <= 0.02
+        if not checks["tp2_min_rr"] or not checks["tp2_rr_matches_prices"]:
+            fail("TP2_RR_INVALID", "TP2 must meet its configured R multiple and match actual prices")
         checks["tp2_above_tp1_rr"] = signal.risk_reward.rr_to_tp2 > signal.risk_reward.rr_to_tp1
         if not checks["tp2_above_tp1_rr"]:
             fail("TP2_RR_NOT_ABOVE_TP1", "TP2 risk/reward must exceed TP1")
@@ -138,16 +161,25 @@ class SignalValidator:
         checks["lot_within_bounds"] = self.risk.min_lot <= sizing.lot_size <= self.risk.max_lot
         if not checks["lot_within_bounds"]:
             fail("LOT_OUT_OF_BOUNDS", f"Lot {sizing.lot_size} outside broker limits")
-        expected_risk = sizing.lot_size * sl_pips * self.risk.pip_value_per_lot
-        checks["risk_matches_sizing"] = abs(expected_risk - sizing.risk_amount_usd) <= max(
-            2.0, sizing.risk_amount_usd * 0.05
+        expected_risk = sizing.units * (abs(entry - sl) + sizing.cost_reserve_pips * pip)
+        checks["risk_matches_sizing"] = abs(expected_risk - sizing.risk_amount_usd) <= 0.02
+        checks["units_match_lots"] = sizing.units > 0 and math.isclose(
+            sizing.units, sizing.lot_size * self.risk.contract_size, abs_tol=1e-6
         )
+        checks["cost_reserve_valid"] = sizing.cost_reserve_pips >= 0
+        checks["risk_within_stated_budget"] = (
+            sizing.account_equity > 0 and sizing.risk_percent > 0 and
+            expected_risk <= sizing.account_equity * sizing.risk_percent / 100 + 1e-6
+        )
+        for key in ("units_match_lots", "cost_reserve_valid", "risk_within_stated_budget"):
+            if not checks[key]:
+                fail(key.upper(), f"Unsafe sizing: {key}")
         if not checks["risk_matches_sizing"]:
             fail(
                 "RISK_MISMATCH",
                 f"Sized risk ${expected_risk:.2f} does not match stated ${sizing.risk_amount_usd:.2f}",
             )
-        checks["risk_within_limit"] = sizing.risk_percent <= self.risk.max_risk_per_trade_percent + 1e-9
+        checks["risk_within_limit"] = 0 < sizing.risk_percent <= self.risk.max_risk_per_trade_percent + 1e-9
         if not checks["risk_within_limit"]:
             fail(
                 "RISK_PERCENT_EXCEEDED",
@@ -155,7 +187,7 @@ class SignalValidator:
             )
         if account_equity is not None and account_equity > 0:
             checks["risk_within_equity"] = (
-                sizing.risk_amount_usd <= account_equity * self.risk.max_risk_per_trade_percent / 100
+                math.isfinite(account_equity) and expected_risk <= account_equity * sizing.risk_percent / 100 + 1e-6
             )
             if not checks["risk_within_equity"]:
                 fail("RISK_EXCEEDS_EQUITY_LIMIT", "Risk amount exceeds configured % of live equity")
