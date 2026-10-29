@@ -69,7 +69,6 @@ from apex_smc_bot.signals.models import (
     TakeProfit,
     TakeProfitPlan,
     TriggerResult,
-    side_for,
 )
 from apex_smc_bot.signals.smart_money import simulate_smart_money
 
@@ -927,10 +926,21 @@ class SignalGenerator:
         base_risk = float(
             risk_percent if risk_percent is not None else self.risk.max_risk_per_trade_percent
         )
-        effective_risk = max(0.01, base_risk * confluence.position_fraction)
+        effective_risk = min(base_risk, self.risk.max_risk_per_trade_percent) * max(
+            0.0, min(1.0, confluence.position_fraction)
+        )
+        if effective_risk <= 0:
+            self.last_rejection = "ZERO_RISK_BUDGET"
+            return None
+        cost_reserve = max(0.0, spread_pips) + 2 * self.risk.max_slippage_pips
+        sl_pips = sl_distance_pips(entry_price, pending.stop_loss, self.risk.pip_size)
+        if sl_pips <= 0 or cost_reserve / sl_pips > self.risk.max_cost_to_stop_ratio:
+            self.last_rejection = "COSTS_TOO_HIGH_FOR_STOP"
+            return None
         try:
             sizing = calculate_position(
-                equity, effective_risk, entry_price, pending.stop_loss, self.risk, pending.direction
+                equity, effective_risk, entry_price, pending.stop_loss, self.risk, pending.direction,
+                cost_reserve_pips=cost_reserve
             )
         except Exception as exc:  # noqa: BLE001 - sizing failures are business rejections
             self.last_rejection = f"SIZING_FAILED: {exc}"
@@ -939,21 +949,20 @@ class SignalGenerator:
         risk_distance = abs(entry_price - pending.stop_loss)
         tp1, tp2, tp3 = pending.tp1, pending.tp2, pending.tp3
         if entry_type == "MARKET" and risk_distance > 0:
-            # A market fill can sit above (long) or below (short) the zone entry,
-            # which shrinks the distance to the zone-based TP1.  Floor TP1 at the
-            # configured R multiple so the trade never risks 1R to make 0.6R.
+            # Rebase the entire ladder, not just TP1. Never manufacture an
+            # out-of-order target or claim the old zone-based R:R after a fill.
             signed = 1.0 if pending.direction == BULLISH else -1.0
-            floor_tp1 = entry_price + signed * risk_distance * self.strategy.min_rr_tp1
-            if (signed > 0 and tp1 < floor_tp1) or (signed < 0 and tp1 > floor_tp1):
-                tp1 = round(floor_tp1, 2)
-            # Keep the ladder ordered after the floor moved TP1.
-            tp2 = tp1 + signed * max(abs(tp2 - tp1), 0.1)
-            tp3 = tp2 + signed * max(abs(tp3 - tp2), 0.1)
+            tp1 = round(entry_price + signed * max(signed * (tp1 - entry_price),
+                         risk_distance * self.strategy.min_rr_tp1), 2)
+            tp2 = round(entry_price + signed * max(signed * (tp2 - entry_price),
+                         risk_distance * self.strategy.min_rr_tp2, signed * (tp1 - entry_price) + 0.2), 2)
+            tp3 = round(entry_price + signed * max(signed * (tp3 - entry_price),
+                         risk_distance * self.strategy.target_rr_tp3, signed * (tp2 - entry_price) + 0.2), 2)
         rr1 = abs(tp1 - entry_price) / risk_distance if risk_distance else 0.0
         rr2 = abs(tp2 - entry_price) / risk_distance if risk_distance else 0.0
         rr3 = abs(tp3 - entry_price) / risk_distance if risk_distance else 0.0
-        if rr1 < 1.0:
-            self.last_rejection = "TP1_BELOW_1R"
+        if rr1 + 0.01 < self.strategy.min_rr_tp1 or rr2 + 0.01 < self.strategy.min_rr_tp2:
+            self.last_rejection = "TARGET_BELOW_MIN_RR"
             return None
 
         direction = pending.direction
@@ -1043,9 +1052,9 @@ class SignalGenerator:
             pending,
             entry=entry_price,
             stop_loss=pending.stop_loss,
-            tp1=pending.tp1,
-            tp2=pending.tp2,
-            tp3=pending.tp3,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
             order_blocks=list(order_blocks or []) + list(htf_order_blocks_from(alignment)),
             fvgs=list(fvgs or []),
         )

@@ -3,9 +3,9 @@
 Safety:
   * refuses to construct in ``live`` environment unless ``allow_live`` is True,
   * verifies credentials are present,
-  * every REST call has timeout + 3-attempt exponential backoff,
+  * reads retry with backoff; ambiguous writes NEVER replay automatically,
   * order payloads always carry a broker-side stop loss,
-  * take-profit is attached at **TP2** (the runner target).  TP1 is managed by the
+  * take-profit is attached at **TP3** (the runner target).  TP1 is managed by the
     position manager as a partial close so a 50% partial can never become a full
     exit if the process dies mid-management.
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime
 from typing import Any
 
@@ -24,6 +25,7 @@ from apex_smc_bot.data.candle_manager import to_utc
 from apex_smc_bot.execution.broker import (
     AccountSnapshot,
     BrokerError,
+    BrokerOutcomeUnknown,
     BrokerNotConfigured,
     OrderRequest,
     OrderResult,
@@ -51,6 +53,7 @@ class OANDAExecutionEngine:
         max_retries: int = 3,
         backoff_seconds: float = 1.5,
         session: aiohttp.ClientSession | None = None,
+        database: Any | None = None,
     ) -> None:
         if not account_id or not access_token:
             raise BrokerNotConfigured(
@@ -70,18 +73,21 @@ class OANDAExecutionEngine:
         self.backoff_seconds = backoff_seconds
         self._session = session
         self._owns_session = session is None
+        self.database = database
+        self._trade_plans = (database.get_runtime_state("oanda_trade_plans", {}) or {}) if database else {}
 
     @classmethod
-    def from_settings(cls, settings: Any) -> "OANDAExecutionEngine":
+    def from_settings(cls, settings: Any, database: Any | None = None) -> "OANDAExecutionEngine":
         secrets: Secrets = settings.secrets
         return cls(
             account_id=secrets.oanda_account_id,
             access_token=secrets.oanda_access_token,
             environment=settings.execution.oanda_environment,
-            allow_live=settings.execution.allow_live_trading,
+            allow_live=settings.execution.allow_live_trading and settings.live_trading_confirmed,
             timeout_seconds=settings.execution.order_timeout_seconds,
             max_retries=settings.execution.max_retries,
             backoff_seconds=settings.execution.retry_backoff_seconds,
+            database=database,
         )
 
     # ------------------------------------------------------------------ plumbing
@@ -111,32 +117,33 @@ class OANDAExecutionEngine:
 
     async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         session = await self._get_session()
-        url = f"{self.base_url}{path}"
-        last_error: str = ""
-        for attempt in range(self.max_retries):
+        read_only = method.upper() == "GET"
+        attempts = max(1, self.max_retries) if read_only else 1
+        for attempt in range(attempts):
             try:
-                async with session.request(method, url, json=payload) as response:
-                    text = await response.text()
-                    if response.status == 429 or response.status >= 500:
-                        last_error = f"HTTP {response.status}: {text[:200]}"
-                        raise BrokerError(last_error)
-                    try:
+                async with session.request(method, f"{self.base_url}{path}", json=payload, allow_redirects=False) as response:
+                    status = response.status
+                    if status == 429 or status >= 500:
+                        if not read_only:
+                            if status == 429:
+                                raise BrokerError("OANDA rate limited the write; no automatic retry")
+                            raise BrokerOutcomeUnknown("OANDA write outcome unknown; reconcile before retry")
+                    elif status >= 400:
+                        # Permanent rejection: never retry it, and never log response bodies.
+                        raise BrokerError(f"OANDA rejected request (HTTP {status})")
+                    elif status >= 300:
+                        raise ValueError("Unexpected broker redirect")
+                    else:
                         data = await response.json(content_type=None)
-                    except Exception:  # noqa: BLE001
-                        data = {}
-                    if response.status >= 400:
-                        message = data.get("errorMessage") or text[:300]
-                        raise BrokerError(f"OANDA rejected {method} {path}: {message}")
-                    return data
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last_error = str(exc)
-            except BrokerError as exc:
-                last_error = str(exc)
-                if "HTTP 4" in last_error and "429" not in last_error:
-                    raise
-            if attempt < self.max_retries - 1:
+                        if not isinstance(data, dict):
+                            raise ValueError("Malformed broker response")
+                        return data
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                if not read_only:
+                    raise BrokerOutcomeUnknown("OANDA write outcome unknown; reconcile before retry") from None
+            if attempt < attempts - 1:
                 await asyncio.sleep(self.backoff_seconds * (2 ** attempt))
-        raise BrokerError(f"OANDA request failed after {self.max_retries} attempts: {last_error}")
+        raise BrokerError(f"OANDA read unavailable after {attempts} attempts")
 
     @staticmethod
     def _price(instrument: str, price: float) -> str:
@@ -159,6 +166,9 @@ class OANDAExecutionEngine:
         self, request: OrderRequest, market_price: float = 0.0, spread_price: float = 0.0
     ) -> OrderResult:
         order_type = request.order_type.upper()
+        if (not all(math.isfinite(value) and value > 0 for value in
+                    (request.units, request.entry_price, request.stop_loss)) or request.units < 1):
+            return OrderResult(False, "REJECTED", message="Invalid order sizing", signal_id=request.signal_id)
         if order_type not in {"MARKET", "LIMIT"}:
             return OrderResult(
                 success=False,
@@ -177,11 +187,18 @@ class OANDAExecutionEngine:
                 "tag": request.client_tag[:128],
                 "comment": f"APEX-SMC {request.signal_id}"[:128],
             },
+            "tradeClientExtensions": {
+                "id": request.signal_id, "tag": request.client_tag[:128],
+            },
             "stopLossOnFill": {
                 "price": self._price(request.instrument, request.stop_loss),
                 "timeInForce": "GTC",
             },
         }
+        if order_type == "MARKET" and market_price > 0:
+            adverse = spread_price / 2 + float(request.metadata.get("max_slippage_price", 0.0))
+            bound = market_price + adverse if request.signed_units > 0 else market_price - adverse
+            order["priceBound"] = self._price(request.instrument, bound)
         if request.take_profit:
             order["takeProfitOnFill"] = {
                 "price": self._price(request.instrument, request.take_profit),
@@ -192,6 +209,9 @@ class OANDAExecutionEngine:
             if request.expires_at:
                 order["timeInForce"] = "GTD"
                 order["gtdTime"] = self._rfc3339(request.expires_at)
+        self._trade_plans[request.signal_id] = dict(request.metadata)
+        if self.database is not None:
+            self.database.set_runtime_state("oanda_trade_plans", self._trade_plans)
         data = await self._request("POST", self._account_path("/orders"), {"order": order})
         return self._parse_order_response(data, request)
 
@@ -231,16 +251,6 @@ class OANDAExecutionEngine:
                 raw=data,
                 signal_id=request.signal_id,
             )
-        created = data.get("orderCreateTransaction")
-        if created:
-            return OrderResult(
-                success=True,
-                status="PENDING",
-                order_id=str(created.get("id", "")),
-                message="order accepted and resting",
-                raw=data,
-                signal_id=request.signal_id,
-            )
         cancel = data.get("orderCancelTransaction")
         if cancel:
             return OrderResult(
@@ -251,10 +261,20 @@ class OANDAExecutionEngine:
                 raw=data,
                 signal_id=request.signal_id,
             )
+        created = data.get("orderCreateTransaction")
+        if created:
+            return OrderResult(
+                success=True,
+                status="PENDING",
+                order_id=str(created.get("id", "")),
+                message="order accepted and resting",
+                raw=data,
+                signal_id=request.signal_id,
+            )
         return OrderResult(
             success=False,
-            status="REJECTED",
-            message=f"Unrecognised OANDA response: {str(data)[:200]}",
+            status="UNKNOWN",
+            message="Unrecognised OANDA write response; reconcile broker",
             raw=data,
             signal_id=request.signal_id,
         )
@@ -392,7 +412,9 @@ class OANDAExecutionEngine:
                         take_profit=float(take.get("price", 0)) if take.get("price") else None,
                         opened_at=datetime.fromisoformat(str(trade.get("openTime")).replace("Z", "+00:00")),
                         current_price=float(trade.get("price", 0) or 0),
-                        metadata={"unrealized_pnl": float(trade.get("unrealizedPL", 0) or 0)},
+                        realized_pnl=float(trade.get("realizedPL", 0) or 0),
+                        metadata={**self._trade_plans.get(str(client.get("id", "")), {}),
+                                  "unrealized_pnl": float(trade.get("unrealizedPL", 0) or 0)},
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -429,8 +451,8 @@ class OANDAExecutionEngine:
             "GET", f"/v3/accounts/{self.account_id}/pricing?instruments={instrument}"
         )
         prices = data.get("prices") or []
-        if not prices:
-            raise BrokerError("OANDA returned no pricing data")
+        if not prices or prices[0].get("tradeable") is False:
+            raise BrokerError("OANDA returned no tradeable pricing data")
         bid = float(prices[0]["bids"][0]["price"])
         ask = float(prices[0]["asks"][0]["price"])
         return bid, ask

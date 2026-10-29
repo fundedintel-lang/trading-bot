@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
 from typing import Any, Callable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -82,21 +81,10 @@ class EngineScheduler:
 
         if self._cycle_busy.locked():
             return
-        try:
-            bars = self.engine.candles.get_candles("M5")
-            price = self.engine._market_price()  # noqa: SLF001 - intentional internal use
-            if price <= 0:
-                return
-            events = await self.engine.positions.on_price(
-                price, self.engine._spread_price(bars[-1] if bars else None), bars, utcnow()  # noqa: SLF001
-            )
-            for event in events:
-                await self.engine.notifier.notify_trade_event(
-                    event.kind, event.to_dict(), text=self.engine._format_event(event)  # noqa: SLF001
-                )
-        except Exception:  # noqa: BLE001
-            logger.exception("Management cycle failed")
-            self._job_errors["management_cycle"] = self._job_errors.get("management_cycle", 0) + 1
+        async with self._cycle_busy:
+            report = await self.engine.management_cycle()
+            if report.errors:
+                self._job_errors["management_cycle"] = self._job_errors.get("management_cycle", 0) + 1
 
     async def refresh_news(self) -> None:
         if self.engine.news is None:

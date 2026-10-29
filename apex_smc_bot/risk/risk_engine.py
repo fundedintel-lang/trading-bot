@@ -13,6 +13,8 @@ raise risk above the configured maximum, ever.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
@@ -23,7 +25,7 @@ from apex_smc_bot.config import Settings
 from apex_smc_bot.data.candle_manager import Candle, to_utc, utcnow
 from apex_smc_bot.risk.caution_zones import CautionResult, evaluate_caution_zones
 from apex_smc_bot.risk.drawdown_monitor import DrawdownDecision, DrawdownMonitor
-from apex_smc_bot.risk.news_filter import NewsCheck, NewsFilter
+from apex_smc_bot.risk.news_filter import NewsCheck
 from apex_smc_bot.risk.spread_monitor import SpreadMonitor, SpreadState
 from apex_smc_bot.signals.models import PendingSetup, Signal
 
@@ -114,7 +116,7 @@ class RiskEngine:
         reasons: list[str] = []
         warnings: list[str] = []
 
-        checks["equity_sufficient"] = equity >= self.risk.min_equity
+        checks["equity_sufficient"] = math.isfinite(equity) and equity > 0 and equity >= self.risk.min_equity
         if not checks["equity_sufficient"]:
             reasons.append(f"Equity ${equity:.2f} below minimum ${self.risk.min_equity:.2f}")
 
@@ -237,11 +239,14 @@ class RiskEngine:
             reasons.append("Signal below minimum confluence")
         if drawdown_decision.reduced_risk:
             warnings.append(drawdown_decision.reason)
-        if risk_percent is not None and signal.position_sizing.risk_percent > risk_percent + 1e-9:
+        allowed_risk = self.risk.max_risk_per_trade_percent * drawdown_decision.risk_multiplier
+        if risk_percent is not None:
+            allowed_risk = min(allowed_risk, risk_percent)
+        if signal.position_sizing.risk_percent > allowed_risk + 1e-9:
             checks["signal_risk_matches_gate"] = False
             reasons.append(
                 f"Signal sizes {signal.position_sizing.risk_percent:.2f}% but the risk gate allowed "
-                f"{risk_percent:.2f}%"
+                f"{allowed_risk:.2f}%"
             )
         allow = all(checks.values())
         return RiskDecision(

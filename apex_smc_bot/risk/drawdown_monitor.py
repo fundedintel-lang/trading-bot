@@ -7,7 +7,8 @@ a circuit breaker or erase a loss streak.
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass, field
+import math
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -146,11 +147,11 @@ class DrawdownMonitor:
         """Update equity, potentially trip the 24H circuit breaker."""
 
         now = to_utc(now or utcnow())
-        if equity <= 0:
-            raise ValueError("equity must be positive")
+        if not math.isfinite(equity):
+            raise ValueError("equity must be finite")
         self.roll_day(now, equity)
         if self.state.daily_start_equity <= 0:
-            self.state.daily_start_equity = float(equity)
+            self.state.daily_start_equity = max(float(equity), self.config.starting_equity)
         self.state.current_equity = float(equity)
         self.state.peak_equity = max(self.state.peak_equity, float(equity))
         self.state.daily_pnl = round(equity - self.state.daily_start_equity, 2)

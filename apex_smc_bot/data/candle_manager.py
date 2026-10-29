@@ -367,6 +367,7 @@ class CandleManager:
         self._candles: dict[str, list[Candle]] = {tf: [] for tf in TIMEFRAME_SECONDS}
         self._lock = asyncio.Lock()
         self._last_quote: tuple[float, float] = (0.0, 0.0)
+        self.quote_received_at: datetime | None = None
 
     # ------------------------------------------------------------------ ingest
     def ingest(self, timeframe: str, candles: Iterable[Candle]) -> int:
@@ -395,12 +396,17 @@ class CandleManager:
 
         return {tf: self.ingest(tf, candles) for tf, candles in data.items()}
 
-    def get_candles(self, timeframe: str, count: int | None = None) -> list[Candle]:
+    def get_candles(
+        self, timeframe: str, count: int | None = None, *, as_of: datetime | None = None
+    ) -> list[Candle]:
         """Return cached candles for ``timeframe`` (most recent ``count``)."""
 
         if timeframe not in self._candles:
             raise ValueError(f"Unsupported timeframe {timeframe!r}")
         candles = self._candles[timeframe]
+        if as_of is not None:
+            cutoff = to_utc(as_of) - timedelta(seconds=TIMEFRAME_SECONDS[timeframe])
+            candles = [bar for bar in candles if bar.timestamp <= cutoff]
         if count is None or count <= 0:
             return list(candles)
         return list(candles[-count:])
@@ -438,12 +444,13 @@ class CandleManager:
         candle = self.latest_candle("M5")
         return round(candle.spread, 4) if candle is not None else 0.0
 
-    def set_quote(self, bid: float, ask: float) -> None:
+    def set_quote(self, bid: float, ask: float, now: datetime | None = None) -> None:
         """Cache the latest quote (used by ``latest_price``/spread)."""
 
-        if bid <= 0 or ask <= 0 or ask < bid:
+        if not math.isfinite(bid) or not math.isfinite(ask) or bid <= 0 or ask <= 0 or ask < bid:
             raise ValueError(f"Invalid quote bid={bid} ask={ask}")
         self._last_quote = (float(bid), float(ask))
+        self.quote_received_at = to_utc(now or utcnow())
 
     # ------------------------------------------------------------------ network
     async def refresh(self, timeframe: str, count: int = 500) -> int:
@@ -452,10 +459,12 @@ class CandleManager:
         if self.feed is None:
             return 0
         candles = await self.feed.fetch_candles(self.instrument, timeframe, count)
+        known = {bar.timestamp: bar for bar in self._candles[timeframe]}
+        changed = [bar for bar in candles if known.get(bar.timestamp) != bar]
         added = self.ingest(timeframe, candles)
-        if self.database is not None:
+        if self.database is not None and changed:
             try:
-                self.database.upsert_candles(self.instrument, timeframe, candles)
+                self.database.upsert_candles(self.instrument, timeframe, changed)
             except Exception:  # pragma: no cover - persistence must never break trading
                 pass
         return added
@@ -496,13 +505,13 @@ class CandleManager:
                         continue
         return loaded
 
-    async def refresh_quote(self) -> tuple[float, float]:
+    async def refresh_quote(self, now: datetime | None = None) -> tuple[float, float]:
         """Refresh and cache the live bid/ask quote."""
 
         if self.feed is None:
             return self._last_quote
         bid, ask = await self.feed.fetch_price(self.instrument)
-        self.set_quote(bid, ask)
+        self.set_quote(bid, ask, now)
         return bid, ask
 
     async def close(self) -> None:

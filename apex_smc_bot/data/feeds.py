@@ -132,10 +132,12 @@ def build_feed(settings: Settings, override: str | None = None) -> DataFeed | No
         override: Force one provider (used by ``main.py --feed synthetic``).
     """
 
-    if override:
+    if override and override != "fallback":
         names = [override]
     else:
         names = [settings.feed.primary, settings.feed.secondary, settings.feed.tertiary]
+    if settings.execution.broker != "paper" and "synthetic" in names:
+        raise FeedUnavailable("Synthetic prices cannot drive a broker account")
     feeds: list[DataFeed] = []
     seen: set[str] = set()
     for name in names:
@@ -146,6 +148,8 @@ def build_feed(settings: Settings, override: str | None = None) -> DataFeed | No
         feed = _build_single(key, settings)
         if feed is not None:
             feeds.append(feed)
+    if not feeds and settings.execution.broker != "paper":
+        raise FeedUnavailable("No real data feed configured; refusing synthetic fallback for OANDA")
     if not feeds:
         logger.warning("No live data feed configured — using synthetic feed")
         feeds.append(

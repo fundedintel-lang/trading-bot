@@ -34,10 +34,10 @@ from apex_smc_bot.core.scheduler import EngineScheduler
 from apex_smc_bot.data.database import Database
 from apex_smc_bot.data.feeds import SUPPORTED_FEEDS, build_feed
 from apex_smc_bot.data.synthetic import SyntheticFeed
-from apex_smc_bot.execution.broker import Broker, BrokerNotConfigured
+from apex_smc_bot.execution.broker import Broker
 from apex_smc_bot.execution.oanda_executor import OANDAExecutionEngine
 from apex_smc_bot.execution.paper_broker import PaperBroker
-from apex_smc_bot.logging_setup import log_engine, setup_logging
+from apex_smc_bot.logging_setup import setup_logging
 
 logger = logging.getLogger("apex.main")
 
@@ -52,16 +52,13 @@ def build_database(settings: Settings) -> Database:
     return Database(settings.database_path)
 
 
-def build_broker(settings: Settings) -> Broker:
-    """Paper broker unless OANDA is configured *and* selected."""
+def build_broker(settings: Settings, database: Database | None = None) -> Broker:
+    """Use the selected broker; explicitly selected OANDA fails closed."""
 
     broker_name = settings.execution.broker
     if broker_name == "oanda":
-        try:
-            return OANDAExecutionEngine.from_settings(settings)
-        except BrokerNotConfigured as exc:
-            logger.error("OANDA broker unavailable (%s) — falling back to paper", exc)
-            print(f"[warn] {exc}\n[warn] Falling back to the PAPER broker.", flush=True)
+        # An explicitly selected broker must not silently become a paper account.
+        return OANDAExecutionEngine.from_settings(settings, database=database)
     return PaperBroker(
         starting_equity=settings.execution.paper_starting_equity,
         database=None,  # engine records trades; avoids duplicate writes
@@ -81,7 +78,7 @@ def build_engine(
 
     settings.ensure_runtime_dirs()
     database = database or build_database(settings)
-    broker = broker or build_broker(settings)
+    broker = broker or build_broker(settings, database=database)
     if synthetic:
         feed: Any | None = SyntheticFeed(
             days=max(30, settings.backtest.days), seed=settings.feed.synthetic_seed
@@ -129,7 +126,7 @@ def _install_signal_handlers(
 
 # ---------------------------------------------------------------------------- commands
 async def cmd_run(settings: Settings, args: argparse.Namespace) -> int:
-    engine = build_engine(settings, feed_override=args.feed)
+    engine = build_engine(settings, feed_override=args.feed, synthetic=args.synthetic)
     scheduler = EngineScheduler(engine, settings)
     loop = asyncio.get_running_loop()
     _install_signal_handlers(loop, engine, scheduler)
@@ -292,7 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument(
         "--end",
         default=None,
-        help="last bar timestamp, ISO-8601 (default: now) — makes runs reproducible",
+        help="UTC end boundary (last included candle must CLOSE by it), ISO-8601",
     )
     p_bt.add_argument(
         "--research",
@@ -306,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_wf.add_argument("--csv", default=None, help="CSV of M5 candles (optional)")
     p_wf.add_argument("--seed", type=int, default=None)
     p_wf.add_argument("--json", default=None, help="write the full result to this path")
-    p_wf.add_argument("--end", default=None, help="last bar timestamp, ISO-8601 (default: now)")
+    p_wf.add_argument("--end", default=None, help="UTC close-time end boundary, ISO-8601 (default: now)")
     p_wf.add_argument("--research", action="store_true")
 
     p_approve = sub.add_parser("approve", help="approve a queued signal")
@@ -373,7 +370,12 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(cmd_run(settings, args))
         if args.command in {"once", "demo"}:
             if args.command == "demo":
+                from dataclasses import replace
                 args.synthetic = True
+                settings = replace(settings, execution=replace(settings.execution, broker="paper"),
+                                   ai=replace(settings.ai, enabled=False), news=replace(settings.news, enabled=False),
+                                   notifications=replace(settings.notifications, telegram_enabled=False,
+                                                         discord_enabled=False, email_enabled=False))
             return asyncio.run(cmd_once(settings, args))
         if args.command == "status":
             return asyncio.run(cmd_status(settings, args))

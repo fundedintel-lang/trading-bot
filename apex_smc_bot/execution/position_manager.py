@@ -18,10 +18,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
-from apex_smc_bot.analysis.structure import BEARISH, BULLISH
+from apex_smc_bot.analysis.structure import BULLISH
 from apex_smc_bot.config import Settings
 from apex_smc_bot.data.candle_manager import Candle, to_utc, utcnow
-from apex_smc_bot.execution.broker import Broker, OrderResult, Position
+from apex_smc_bot.execution.broker import Broker, BrokerOutcomeUnknown, OrderResult, Position
 from apex_smc_bot.execution.trail_stop import next_stop, partial_units
 
 logger = logging.getLogger("apex.execution.positions")
@@ -59,6 +59,7 @@ class _TradeState:
     tp2_hit: bool = False
     tp3_hit: bool = False
     realized: float = 0.0
+    uncertain: bool = False
 
 
 class PositionManager:
@@ -97,6 +98,10 @@ class PositionManager:
             float(tp3) if tp3 is not None else None,
         )
 
+    def _save_state(self) -> None:
+        if self.database is not None:
+            self.database.set_runtime_state("position_management", self.managed_state())
+
     def _state_for(self, position: Position) -> _TradeState:
         state = self._state.get(position.trade_id)
         if state is None:
@@ -104,9 +109,21 @@ class PositionManager:
                 tp1_hit=position.tp1_hit,
                 tp2_hit=position.tp2_hit,
                 tp3_hit=position.tp3_hit,
+                realized=position.realized_pnl,
             )
+            if self.database is not None:
+                saved = (self.database.get_runtime_state("position_management", {}) or {}).get(position.trade_id)
+                if saved:
+                    state = _TradeState(**saved)
             self._state[position.trade_id] = state
         return state
+
+    def _persist_position(self, position: Position) -> None:
+        if self.database is not None:
+            payload = position.to_dict()
+            self.database.record_trade({**payload,
+                "lots": position.initial_units / self.settings.risk.contract_size,
+                "payload": payload})
 
     def _notify_closed(self, position: Position, pnl: float, reason: str) -> None:
         if self.risk_engine is not None:
@@ -114,6 +131,11 @@ class PositionManager:
                 self.risk_engine.note_trade_closed(pnl, self._clock)
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to notify risk engine of trade close")
+        position.status = "CLOSED"
+        position.units = 0.0
+        position.closed_at = position.closed_at or self._clock
+        position.realized_pnl = pnl
+        self._persist_position(position)
         if self.database is not None:
             try:
                 self.database.record_event(
@@ -135,6 +157,11 @@ class PositionManager:
         before = position.realized_pnl
         try:
             result: OrderResult = await self.broker.partial_close(position.trade_id, units, price)
+        except BrokerOutcomeUnknown:
+            self._state_for(position).uncertain = True
+            self._save_state()
+            logger.error("Partial close outcome unknown for %s; manual reconciliation required", position.trade_id)
+            return False, 0.0
         except Exception as exc:  # noqa: BLE001
             logger.error("Partial close failed for %s: %s", position.trade_id, exc)
             return False, 0.0
@@ -145,19 +172,24 @@ class PositionManager:
             position.realized_pnl - before, 2
         )
         if self.broker.name != "paper":
-            position.units = max(0.0, round(position.units - units, 4))
+            position.units = max(0.0, round(position.units - result.units, 4))
         return True, round(pnl, 2)
 
-    async def _safe_close(self, position: Position, price: float, reason: str) -> float:
+    async def _safe_close(self, position: Position, price: float, reason: str) -> float | None:
         before = position.realized_pnl
         try:
             result = await self.broker.close_position(position.trade_id, price, reason)
+        except BrokerOutcomeUnknown:
+            self._state_for(position).uncertain = True
+            self._save_state()
+            logger.error("Close outcome unknown for %s; manual reconciliation required", position.trade_id)
+            return None
         except Exception as exc:  # noqa: BLE001
             logger.error("Close failed for %s: %s", position.trade_id, exc)
-            return 0.0
+            return None
         if not result.success:
             logger.warning("Close rejected for %s: %s", position.trade_id, result.message)
-            return 0.0
+            return None
         pnl = result.realized_pnl if result.realized_pnl is not None else round(
             position.realized_pnl - before, 2
         )
@@ -168,6 +200,10 @@ class PositionManager:
     async def _apply_stop(self, position: Position, stop: float, reason: str) -> bool:
         try:
             result = await self.broker.modify_stop(position.trade_id, stop)
+        except BrokerOutcomeUnknown:
+            self._state_for(position).uncertain = True
+            self._save_state()
+            return False
         except Exception as exc:  # noqa: BLE001
             logger.error("Stop modification failed for %s: %s", position.trade_id, exc)
             return False
@@ -185,6 +221,7 @@ class PositionManager:
         spread_price: float = 0.0,
         candles_5m: Sequence[Candle] | None = None,
         now: datetime | None = None,
+        *, bar: Candle | None = None,
     ) -> list[PositionEvent]:
         """Re-evaluate every open position at the latest price."""
 
@@ -194,7 +231,10 @@ class PositionManager:
             raise ValueError("market_price must be positive")
         if hasattr(self.broker, "mark_price"):
             try:
-                await self.broker.mark_price(market_price, spread_price, now)  # type: ignore[attr-defined]
+                if bar is not None and self.broker.name == "paper":
+                    await self.broker.mark_price(market_price, spread_price, now, bar=bar)
+                else:
+                    await self.broker.mark_price(market_price, spread_price, now)  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
                 logger.exception("Paper mark-to-market failed")
 
@@ -203,10 +243,15 @@ class PositionManager:
         for position in positions:
             if not position.is_open:
                 continue
-            events.extend(await self._manage(position, market_price, candles_5m, now))
+            executable = market_price
+            if self.broker.name == "paper":
+                executable += -spread_price / 2 if position.is_long else spread_price / 2
+            events.extend(await self._manage(position, executable, candles_5m, now, bar, spread_price))
+            self._persist_position(position)
 
         events.extend(await self._reconcile(positions, now))
         self._known = {p.trade_id: copy.deepcopy(p) for p in positions}
+        self._save_state()
         return events
 
     async def _manage(
@@ -215,16 +260,30 @@ class PositionManager:
         market_price: float,
         candles_5m: Sequence[Candle] | None,
         now: datetime,
+        bar: Candle | None = None,
+        spread_price: float = 0.0,
     ) -> list[PositionEvent]:
         events: list[PositionEvent] = []
         bullish = position.direction == BULLISH
         tp1, tp2, tp3 = self._tp_levels(position)
         state = self._state_for(position)
+        if state.uncertain:
+            return events  # broker-side protection remains; never repeat an ambiguous partial
 
-        # 1) Protective stop (paper broker: emulate the broker-side stop).
-        hit_stop = market_price <= position.stop_loss if bullish else market_price >= position.stop_loss
+        # Replay uses OHLC for pre-existing positions; if stop and target both
+        # trade in a bar, STOP WINS. The unknowable intrabar path is never picked
+        # to make a backtest profitable. A newly filled limit can stop out in the
+        # same bar, but cannot claim a high/low target that preceded its fill.
+        half = spread_price / 2 if self.broker.name == "paper" else 0.0
+        adverse = (bar.low - half if bullish else bar.high + half) if bar else market_price
+        favorable = market_price
+        if bar is not None and to_utc(position.opened_at) <= bar.timestamp:
+            favorable = bar.high - half if bullish else bar.low + half
+        hit_stop = adverse <= position.stop_loss if bullish else adverse >= position.stop_loss
         if hit_stop and self.broker.name == "paper":
-            fill = min(position.stop_loss, market_price) if bullish else max(position.stop_loss, market_price)
+            gap_price = (bar.open - half if bullish else bar.open + half) if bar else market_price
+            fill = min(position.stop_loss, gap_price) if bullish else max(position.stop_loss, gap_price)
+            fill += -self.broker.slippage_price if bullish else self.broker.slippage_price
             # A stop that has been trailed past the entry (or to breakeven) closes
             # the trade in profit — labelling that STOP_LOSS would make the trade
             # journal lie about what happened.  The reason is decided *before* the
@@ -238,6 +297,8 @@ class PositionManager:
                 else ("BREAKEVEN_STOP" if abs(projected_total) < 0.01 else "TRAIL_STOP")
             )
             pnl = await self._safe_close(position, fill, reason)
+            if pnl is None:
+                return events
             total = round(state.realized + pnl, 2)
             self._notify_closed(position, total, reason)
             self._state.pop(position.trade_id, None)
@@ -272,7 +333,12 @@ class PositionManager:
                 except Exception:  # noqa: BLE001
                     let_winner_run = False
             if age_hours >= max_age_hours and not let_winner_run:
-                pnl = await self._safe_close(position, market_price, "TIME_EXIT")
+                exit_price = market_price
+                if self.broker.name == "paper":
+                    exit_price += -self.broker.slippage_price if bullish else self.broker.slippage_price
+                pnl = await self._safe_close(position, exit_price, "TIME_EXIT")
+                if pnl is None:
+                    return events
                 total = round(state.realized + pnl, 2)
                 self._notify_closed(position, total, "TIME_EXIT")
                 self._state.pop(position.trade_id, None)
@@ -293,7 +359,7 @@ class PositionManager:
 
         # 2) TP1 — close 50 %, move to breakeven.
         if tp1 is not None and not state.tp1_hit:
-            reached = market_price >= tp1 if bullish else market_price <= tp1
+            reached = favorable >= tp1 if bullish else favorable <= tp1
             if reached:
                 units = partial_units(position.initial_units, self._tp1_fraction, position.units)
                 ok, pnl = await self._safe_partial(position, units, tp1)
@@ -339,7 +405,7 @@ class PositionManager:
 
         # 3) TP2 — close 25 % of original, lock stop at TP1.
         if tp2 is not None and state.tp1_hit and not state.tp2_hit and position.is_open:
-            reached = market_price >= tp2 if bullish else market_price <= tp2
+            reached = favorable >= tp2 if bullish else favorable <= tp2
             if reached:
                 units = partial_units(position.initial_units, self._tp2_fraction, position.units)
                 ok, pnl = await self._safe_partial(position, units, tp2)
@@ -373,10 +439,12 @@ class PositionManager:
 
         # 4) TP3 — close the runner.
         if tp3 is not None and state.tp2_hit and not state.tp3_hit and position.is_open:
-            reached = market_price >= tp3 if bullish else market_price <= tp3
+            reached = favorable >= tp3 if bullish else favorable <= tp3
             if reached:
                 units = position.units
                 pnl = await self._safe_close(position, tp3, "TP3")
+                if pnl is None:
+                    return events
                 state.tp3_hit = True
                 state.realized = round(state.realized + pnl, 2)
                 self._notify_closed(position, state.realized, "TP3")
@@ -447,7 +515,9 @@ class PositionManager:
                     closed = None
             if closed:
                 try:
-                    pnl = float(closed.get("realizedPL", pnl) or pnl)
+                    reported_pnl = closed.get("realizedPL")
+                    if reported_pnl is not None:
+                        pnl = float(reported_pnl)
                 except (TypeError, ValueError):
                     pass
             events.append(
@@ -475,20 +545,31 @@ class PositionManager:
         now: datetime | None = None,
     ) -> PositionEvent | None:
         now = to_utc(now or utcnow())
+        self._clock = now
         positions = {p.trade_id: p for p in await self.broker.get_positions()}
         position = positions.get(trade_id) or self._known.get(trade_id)
         if position is None:
             return None
         units = position.units
-        state = self._state.pop(trade_id, None) or _TradeState()
-        pnl = await self._safe_close(position, price or position.current_price, reason)
+        state = self._state_for(position)
+        if state.uncertain:
+            state.realized = position.realized_pnl
+        exit_price = price or position.current_price
+        if self.broker.name == "paper":
+            exit_price = self.broker._exit_price(exit_price, position.is_long)
+        pnl = await self._safe_close(position, exit_price, reason)
+        if pnl is None:
+            return None
+        self._state.pop(trade_id, None)
+        self._known.pop(trade_id, None)
+        self._save_state()
         total = round(state.realized + pnl, 2)
         self._notify_closed(position, total, reason)
         return PositionEvent(
             "CLOSED",
             trade_id,
             position.signal_id,
-            price or position.current_price,
+            exit_price,
             units,
             pnl,
             f"Closed ({reason}) — total {total:+.2f}",
@@ -511,6 +592,10 @@ class PositionManager:
     async def open_positions(self) -> list[Position]:
         return await self.broker.get_positions()
 
+    @property
+    def has_uncertain_operations(self) -> bool:
+        return any(state.uncertain for state in self._state.values())
+
     def managed_state(self) -> dict[str, Any]:
         return {
             trade_id: {
@@ -518,6 +603,7 @@ class PositionManager:
                 "tp2_hit": state.tp2_hit,
                 "tp3_hit": state.tp3_hit,
                 "realized": state.realized,
+                "uncertain": state.uncertain,
             }
             for trade_id, state in self._state.items()
         }

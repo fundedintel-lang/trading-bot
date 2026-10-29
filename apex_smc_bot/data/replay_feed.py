@@ -8,10 +8,11 @@ no look-ahead bias.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from bisect import bisect_right
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Mapping, Sequence
 
-from apex_smc_bot.data.candle_manager import Candle, DataFeed, floor_to_timeframe, to_utc
+from apex_smc_bot.data.candle_manager import Candle, DataFeed, TIMEFRAME_SECONDS, to_utc
 
 
 class ReplayFeed(DataFeed):
@@ -28,16 +29,16 @@ class ReplayFeed(DataFeed):
         if "M5" not in data or not data["M5"]:
             raise ValueError("ReplayFeed requires a non-empty M5 series")
         self._data: dict[str, list[Candle]] = {
-            timeframe: list(data[timeframe])
+            timeframe: sorted(data[timeframe], key=lambda candle: candle.timestamp)
             for timeframe in timeframes
             if timeframe in data
         }
         self.spread_price = max(0.0, float(spread_price))
         self._cursor = 0
-        self._by_timeframe: dict[str, dict[datetime, int]] = {
-            timeframe: {candle.timestamp: index for index, candle in enumerate(bars)}
-            for timeframe, bars in self._data.items()
-        }
+        self._timestamps = {tf: [bar.timestamp for bar in bars] for tf, bars in self._data.items()}
+        for tf, timestamps in self._timestamps.items():
+            if len(set(timestamps)) != len(timestamps):
+                raise ValueError(f"Duplicate {tf} candle timestamps")
 
     # ------------------------------------------------------------------ cursor
     @property
@@ -75,20 +76,13 @@ class ReplayFeed(DataFeed):
         bars = self._data.get(timeframe)
         if not bars:
             return []
-        cutoff = self.now
-        index = self._by_timeframe[timeframe]
-        position = index.get(floor_to_timeframe(cutoff, timeframe))
-        if position is None:
-            # Binary-search-free fallback: last bar at or before the cutoff.
-            position = -1
-            for offset in range(len(bars) - 1, -1, -1):
-                if bars[offset].timestamp <= cutoff:
-                    position = offset
-                    break
-            if position < 0:
-                return []
-        start = max(0, position + 1 - max(1, int(count)))
-        return bars[start : position + 1]
+        # Candle timestamps are OPEN times. At the close of this M5 bar,
+        # a precomputed H4 candle may still contain 3h55m of future prices.
+        as_of = self.now + timedelta(seconds=TIMEFRAME_SECONDS["M5"])
+        latest_open = as_of - timedelta(seconds=TIMEFRAME_SECONDS[timeframe])
+        stop = bisect_right(self._timestamps[timeframe], latest_open)
+        start = max(0, stop - count) if count > 0 else 0
+        return bars[start:stop]
 
     async def fetch_price(self, instrument: str) -> tuple[float, float]:
         close = self.bars[self._cursor].close

@@ -21,15 +21,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Sequence
 
+from apex_smc_bot.ai.reviewer import AITradeReviewer
 from apex_smc_bot.analysis.confluence import ConfluenceEngine, ConfluenceResult
 from apex_smc_bot.analysis.fvg import detect_fvg
 from apex_smc_bot.analysis.htf_bias import AlignmentResult, HTFBiasEngine
-from apex_smc_bot.analysis.liquidity import build_liquidity_map, detect_inducement
+from apex_smc_bot.analysis.liquidity import build_liquidity_map
 from apex_smc_bot.analysis.order_blocks import detect_order_blocks
 from apex_smc_bot.analysis.premium_discount import dealing_range_from_structure
 from apex_smc_bot.analysis.session import Session, SessionEngine, detect_judas_swing
@@ -37,7 +39,7 @@ from apex_smc_bot.analysis.structure import BEARISH, BULLISH, analyze_structure
 from apex_smc_bot.config import Settings
 from apex_smc_bot.core.state_manager import StateManager
 from apex_smc_bot.data.candle_manager import (
-    REQUIRED_TIMEFRAMES,
+    TIMEFRAME_SECONDS,
     Candle,
     CandleManager,
     to_utc,
@@ -52,7 +54,6 @@ from apex_smc_bot.notifications.notifier import Notifier
 from apex_smc_bot.risk.news_filter import NewsFilter
 from apex_smc_bot.risk.risk_engine import RiskDecision, RiskEngine
 from apex_smc_bot.signals.models import PendingSetup, Signal, TriggerResult
-from apex_smc_bot.signals.signal_formatter import format_rejection
 from apex_smc_bot.signals.signal_generator import SignalGenerator
 from apex_smc_bot.signals.signal_validator import SignalValidator
 
@@ -125,6 +126,9 @@ class TradingEngine:
         notifier: Notifier | None = None,
         logging_bundle: Any | None = None,
     ) -> None:
+        settings.validate()
+        if broker.name != "paper" and getattr(feed, "name", "") in {"synthetic", "replay"}:
+            raise ValueError("Simulated prices cannot drive a real broker")
         self.settings = settings
         self.broker = broker
         self.database = database
@@ -143,7 +147,14 @@ class TradingEngine:
         self.validator = SignalValidator(settings)
         self.htf = HTFBiasEngine(settings)
         self.sessions = SessionEngine(settings.sessions)
-        self.orders = OrderManager(settings, broker, database)
+        self.ai = AITradeReviewer(settings, database)
+        self.orders = OrderManager(
+            settings, broker, database, risk_engine=self.risk,
+            quote_provider=self._execution_quote, execution_guard=self._execution_guard,
+            review_guard=self._review_signal if settings.ai.enabled else None,
+            final_guard=self._instant_execution_gate,
+            clock=self._execution_now,
+        )
         self.positions = PositionManager(settings, broker, database, risk_engine=self.risk)
 
         self._cycle_id = 0
@@ -201,6 +212,7 @@ class TradingEngine:
                 self.database.close()
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to close database")
+        await self.ai.close()
         await self.notifier.close()
         try:
             await self.broker.close()
@@ -215,7 +227,7 @@ class TradingEngine:
         print(f"APEX-SMC engine stopped ({reason}).", flush=True)
 
     # ------------------------------------------------------------------ data
-    async def _refresh_data(self) -> None:
+    async def _refresh_data(self, now: datetime | None = None) -> None:
         """Pull fresh candles and quote; tolerate individual timeframe failures."""
 
         if self.candles.feed is not None:
@@ -225,22 +237,20 @@ class TradingEngine:
                 self.state.note_error(f"candle refresh: {exc}")
                 log_exception(logger, "candle_refresh_failed", exc)
         try:
-            bid, ask = await self.candles.refresh_quote()
-            if bid > 0 and ask > 0:
-                self.candles.set_quote(bid, ask)
+            await self._refresh_quote(now)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Quote refresh failed: %s", exc)
 
-        if self.database is not None:
-            for timeframe in REQUIRED_TIMEFRAMES:
-                bars = self.candles.get_candles(timeframe)
-                if bars:
-                    try:
-                        self.database.upsert_candles(
-                            self.settings.bot.instrument, timeframe, bars[-300:]
-                        )
-                    except Exception:  # noqa: BLE001
-                        logger.debug("Candle persistence failed for %s", timeframe, exc_info=True)
+    async def _refresh_quote(self, now: datetime) -> None:
+        # Auxiliary candle feeds may report an assumed spread. Broker execution
+        # must use the broker's native executable quote, not that approximation.
+        if self.broker.name == "oanda":
+            bid, ask = await self.broker.get_quote(self.settings.bot.instrument)
+            self.candles.set_quote(bid, ask, now)
+        elif self.candles.feed is not None:
+            await self.candles.refresh_quote(now=now)
+        else:
+            raise BrokerError("No fresh quote provider")
 
     def _market_price(self, timeframe: str = "M5") -> float:
         price = self.candles.latest_price
@@ -272,13 +282,15 @@ class TradingEngine:
         self.state.tick_cycle(now)
 
         try:
-            await self._refresh_data()
-            bars_5m = self.candles.get_candles("M5")
-            bars_15m = self.candles.get_candles("M15")
-            bars_1h = self.candles.get_candles("H1")
-            bars_4h = self.candles.get_candles("H4")
+            await self._refresh_data(now)
+            bars_5m = self.candles.get_candles("M5", as_of=now)
+            bars_15m = self.candles.get_candles("M15", as_of=now)
+            bars_1h = self.candles.get_candles("H1", as_of=now)
+            bars_4h = self.candles.get_candles("H4", as_of=now)
 
             if len(bars_5m) < 10 or len(bars_15m) < 30:
+                # History/bootstrap trouble is never a reason to ignore stops.
+                await self._manage_positions(report, bars_5m, now)
                 report.skipped = "INSUFFICIENT_DATA"
                 return report
 
@@ -297,11 +309,18 @@ class TradingEngine:
             report.risk = {"equity": round(equity, 2), "drawdown": drawdown.to_dict()}
             await self._handle_circuit_breaker(drawdown, report)
 
-            # -------- position management ------------------------------------
-            await self._manage_positions(report, bars_5m, now)
-
-            # -------- gating --------------------------------------------------
+            # Cancel entry exposure BEFORE a paper mark can fill resting orders.
+            self.orders.expire_pending(now)
             skip_reason = await self._hard_gates(now, session, report)
+            if skip_reason:
+                try:
+                    await self.orders.cancel_pending_entries()
+                except Exception:
+                    self.state.pause("entry cancellation failed; reconcile broker")
+                    report.errors.append("ENTRY_CANCELLATION_FAILED")
+
+            # Stops/exits still run when new entries are blocked.
+            await self._manage_positions(report, bars_5m, now)
             if skip_reason:
                 report.skipped = skip_reason
                 self.state.prune(now)
@@ -369,7 +388,11 @@ class TradingEngine:
     async def _account_equity(self, report: CycleReport) -> float:
         try:
             account = await self.broker.get_account()
-            return float(account.equity or account.balance)
+            equity = (self.broker.equity(self._market_price(), spread_price=self._spread_price()) if self.broker.name == "paper"
+                      else float(account.equity))
+            if not math.isfinite(equity):
+                raise ValueError("invalid account equity")
+            return float(equity)
         except Exception as exc:  # noqa: BLE001
             report.errors.append(f"account: {exc}")
             logger.warning("Account snapshot failed (%s) — using cached equity", exc)
@@ -385,10 +408,14 @@ class TradingEngine:
         if "COOLDOWN" in reason.upper() and not getattr(drawdown, "breaker_triggered", False):
             report.skipped = reason
             return
-        if self._halted_notified and not getattr(drawdown, "breaker_triggered", False):
-            return
         logger.error("CIRCUIT BREAKER: %s", reason)
-        events = await self.positions.force_close_all(reason="CIRCUIT_BREAKER")
+        try:
+            await self.orders.cancel_pending_entries()
+        except Exception:
+            report.errors.append("BREAKER_ENTRY_CANCELLATION_FAILED")
+        events = await self.positions.force_close_all(reason="CIRCUIT_BREAKER", price=self._market_price(), now=report.started_at)
+        if self._halted_notified and not events:
+            return
         self._halted_notified = True
         report.position_events.extend(event.kind for event in events)
         await self.notifier.notify_trade_event(
@@ -403,9 +430,14 @@ class TradingEngine:
         price = self._market_price()
         if price <= 0:
             return
+        received = self.candles.quote_received_at
+        if received is None or not 0 <= (now - received).total_seconds() <= self.settings.feed.max_quote_age_seconds:
+            report.rejections.append("POSITION_MANAGEMENT_NO_FRESH_QUOTE")
+            return
         try:
             events: list[PositionEvent] = await self.positions.on_price(
-                price, self._spread_price(bars_5m[-1] if bars_5m else None), bars_5m, now
+                price, self._spread_price(bars_5m[-1] if bars_5m else None), bars_5m, now,
+                bar=bars_5m[-1] if getattr(self.candles.feed, "name", "") == "replay" and bars_5m else None,
             )
         except Exception as exc:  # noqa: BLE001
             report.errors.append(f"positions: {exc}")
@@ -419,7 +451,7 @@ class TradingEngine:
                     self.database.update_trade(
                         event.trade_id,
                         status="CLOSED",
-                        realized_pnl=event.pnl,
+                        realized_pnl=event.metadata.get("total_pnl", event.pnl),
                         closed_at=now.isoformat(),
                     )
                 except Exception:  # noqa: BLE001
@@ -444,6 +476,15 @@ class TradingEngine:
 
         if self.state.paused:
             return "PAUSED"
+        if self.positions.has_uncertain_operations:
+            return "EXECUTION_UNCERTAIN: reconcile broker; use explicit close to flatten"
+        freshness = self._data_gate(now)
+        if freshness:
+            return freshness
+        if any(error.startswith("account:") for error in report.errors):
+            return "ACCOUNT_UNAVAILABLE"
+        if not self.risk.spread.is_tradeable(now):
+            return "SPREAD_NOT_TRADEABLE"
         if now.weekday() >= 5:
             return "WEEKEND"
         if not session.tradeable:
@@ -458,12 +499,80 @@ class TradingEngine:
                 check = self.news.check(now)
                 report.risk["news"] = check.to_dict()
                 if not check.safe:
+                    if check.source == "unavailable":
+                        return "NEWS_UNAVAILABLE"
                     return f"NEWS_BLACKOUT:{','.join(event.title for event in check.events)[:80]}"
             except Exception as exc:  # noqa: BLE001
                 report.errors.append(f"news: {exc}")
                 log_exception(logger, "news_check_failed", exc)
+                if self.settings.news.fail_closed:
+                    return "NEWS_UNAVAILABLE"
         if not self._within_session_window(now, session):
             return f"OUTSIDE_KILL_ZONE:{session.name}"
+        return ""
+
+    def _execution_now(self) -> datetime:
+        feed = self.candles.feed
+        if getattr(feed, "name", "") == "replay":
+            return feed.now + timedelta(minutes=5)
+        return utcnow()
+
+    def _data_gate(self, now: datetime) -> str:
+        bars = self.candles.get_candles("M5", as_of=now)
+        if not bars:
+            return "NO_CLOSED_M5_DATA"
+        age = (now - bars[-1].timestamp - timedelta(minutes=5)).total_seconds()
+        if age > self.settings.feed.max_candle_age_seconds:
+            return "STALE_CANDLES"
+        received = self.candles.quote_received_at
+        if received is None or not 0 <= (now - received).total_seconds() <= self.settings.feed.max_quote_age_seconds:
+            return "STALE_OR_MISSING_QUOTE"
+        for timeframe in ("M15", "H1", "H4"):
+            candles = self.candles.get_candles(timeframe, as_of=now)
+            if not candles:
+                return f"MISSING_{timeframe}_HISTORY"
+            close = candles[-1].timestamp + timedelta(seconds=TIMEFRAME_SECONDS[timeframe])
+            if (now - close).total_seconds() > TIMEFRAME_SECONDS[timeframe] + self.settings.feed.max_candle_age_seconds:
+                return f"STALE_{timeframe}_HISTORY"
+        return ""
+
+    async def _execution_quote(self) -> tuple[float, float]:
+        now = self._execution_now()
+        await self._refresh_quote(now)
+        if self._data_gate(now):
+            raise BrokerError("Market data unavailable or stale")
+        return self._market_price(), self._spread_price()
+
+    async def _execution_guard(self, signal: Signal, price: float, spread: float, now: datetime) -> str:
+        report = CycleReport(self._cycle_id, now)
+        return await self._hard_gates(now, self.sessions.get_current_session(now), report)
+
+    def _instant_execution_gate(self, signal: Signal, now: datetime) -> str:
+        """No awaits: check the CURRENT clock again after all slow preflight I/O."""
+        if self.state.paused or self.positions.has_uncertain_operations:
+            return "PAUSED_OR_EXECUTION_UNCERTAIN"
+        problem = self._data_gate(now)
+        if problem:
+            return problem
+        session = self.sessions.get_current_session(now)
+        if now.weekday() >= 5 or not session.tradeable or not self._within_session_window(now, session):
+            return "SESSION_CHANGED_DURING_PREFLIGHT"
+        if not self.risk.drawdown.decision(now).allow_trading:
+            return "RISK_HALT_DURING_PREFLIGHT"
+        if self.news is not None and not self.news.check(now).safe:
+            return "NEWS_BLACKOUT_DURING_PREFLIGHT"
+        return ""
+
+    async def _review_signal(self, signal: Signal, price: float, spread: float, now: datetime) -> str:
+        review = await self.ai.review(
+            signal, self.candles.get_candles("M5", as_of=now), price,
+            spread / self.settings.risk.pip_size, now,
+        )
+        signal.analysis["ai_review"] = review.to_dict()
+        if self.database is not None:
+            self.database.record_event("AI_REVIEW", {"signal_id": signal.signal_id, **review.to_dict()})
+        if not self.ai.allows(review):
+            return f"AI_REVIEW:{review.decision}:{review.reason}"
         return ""
 
     def _within_session_window(self, now: datetime, session: Session) -> bool:
@@ -691,7 +800,7 @@ class TradingEngine:
             session=session,
             spread_price=spread_price,
             pending=pending,
-            candles_15m=self.candles.get_candles("M15"),
+            candles_15m=self.candles.get_candles("M15", as_of=now),
             order_blocks=order_blocks,
             market_price=price,
         )
@@ -765,13 +874,30 @@ class TradingEngine:
             await self.notifier.notify_rejection("VALIDATION_FAILED", validation.to_dict())
             return
 
+        if self.settings.ai.enabled:
+            ai_problem = await self._review_signal(signal, price, spread_price, now)
+            if ai_problem:
+                report.rejections.append(ai_problem)
+                self.state.note_rejection()
+                # Retire a vetoed setup for its lifetime instead of paying for
+                # the same rejection on every subsequent 5M bar.
+                self.state.mark_signalled(pending, signal, now=now)
+                signal.status = "AI_VETOED"
+                if self.database is not None:
+                    self.database.record_signal(signal.signal_id, signal.timestamp, signal.instrument,
+                                                signal.direction, signal.to_dict(), signal.confluence_score,
+                                                status="AI_VETOED")
+                return
+
         # Persist + broadcast the signal before routing the order.
-        self.state.mark_signalled(pending, signal)
+        self.state.mark_signalled(pending, signal, now=now)
         report.signals += 1
         report.signal_ids.append(signal.signal_id)
         await self.notifier.notify_signal(signal)
 
         result: OrderResult = await self.orders.submit(signal, price, spread_price, now)
+        if result.status == "UNKNOWN":
+            self.state.pause("Broker outcome unknown; reconcile broker before resuming")
         if result.status == "PENDING_APPROVAL":
             await self.notifier.notify_trade_event(
                 "AWAITING_APPROVAL",
@@ -794,8 +920,35 @@ class TradingEngine:
                 "ORDER_REJECTED", result.to_dict(), text=f"❌ Order rejected: {result.message}"
             )
 
+    async def management_cycle(self, now: datetime | None = None) -> CycleReport:
+        """30-second management must refresh the quote, not reuse a 5-minute mark."""
+        now = to_utc(now or utcnow())
+        report = CycleReport(self._cycle_id, now)
+        async with self._lock:
+            try:
+                await self._refresh_quote(now)
+                bars = self.candles.get_candles("M5", as_of=now)
+                equity = await self._account_equity(report)
+                self.state.set_last_equity(equity)
+                drawdown = self.risk.update_equity(equity, now)
+                self.risk.update_spread(self._spread_price(), now)
+                await self._handle_circuit_breaker(drawdown, report)
+                skip = await self._hard_gates(now, self.sessions.get_current_session(now), report)
+                if skip:
+                    await self.orders.cancel_pending_entries()
+                await self._manage_positions(report, bars, now)
+            except Exception:
+                report.errors.append("MANAGEMENT_OR_QUOTE_UNAVAILABLE")
+                logger.warning("Management quote/preflight unavailable; not using stale marks")
+        return report
+
     # ------------------------------------------------------------------ commands
     async def handle_command(self, command: str, args: list[str]) -> str:
+        """Operator actions cannot race a trading or management cycle."""
+        async with self._lock:
+            return await self._handle_command(command, args)
+
+    async def _handle_command(self, command: str, args: list[str]) -> str:
         """Telegram/CLI command dispatch. Returns the reply text."""
 
         command = command.lower().lstrip("/")
@@ -830,6 +983,8 @@ class TradingEngine:
             if not args:
                 return "Usage: /approve <signal_id>"
             result = await self.orders.approve(args[0], price, spread)
+            if result.status == "UNKNOWN":
+                self.state.pause("Broker outcome unknown; reconcile broker before resuming")
             if result.success:
                 return f"✅ Approved {args[0]} — {result.status} @ {result.filled_price}"
             return f"❌ Could not approve {args[0]}: {result.message}"
@@ -844,10 +999,12 @@ class TradingEngine:
             event = await self.positions.force_close(args[0], "MANUAL", price)
             return f"Closed {args[0]} ({event.pnl:+.2f})" if event else f"Unknown trade {args[0]}"
         if command == "closeall":
+            await self.orders.cancel_pending_entries()
             events = await self.positions.force_close_all("MANUAL", price)
-            return f"Closed {len(events)} position(s)."
+            return f"Cancelled pending entries; closed {len(events)} position(s)."
         if command == "pause":
             self.state.pause("telegram")
+            await self.orders.cancel_pending_entries()
             return "⏸ Trading paused — positions still managed."
         if command == "resume":
             self.state.resume()
@@ -874,6 +1031,7 @@ class TradingEngine:
             f"equity: ${self.state.last_equity(self.settings.risk.starting_equity):,.2f}",
             f"price: {self._market_price():.2f} · spread {self._spread_price():.2f}",
             f"session: {self.sessions.get_current_session().name}",
+            f"AI: {self.settings.ai.provider} / {self.settings.ai.mode}" if self.settings.ai.enabled else "AI: disabled",
         ]
         if report is not None:
             lines.append(
@@ -911,6 +1069,7 @@ class TradingEngine:
             "positions": positions,
             "pending_approvals": self.orders.get_pending_approvals(),
             "notifications": self.notifier.active_channels,
+            "ai": self.ai.status(),
             "price": self._market_price(),
             "spread": self._spread_price(),
         }

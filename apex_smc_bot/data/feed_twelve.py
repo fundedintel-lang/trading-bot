@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
 
-from apex_smc_bot.data.candle_manager import Candle, DataFeed
+from apex_smc_bot.data.candle_manager import Candle, DataFeed, TIMEFRAME_SECONDS, utcnow
 from apex_smc_bot.data.feed_base import FeedError, FeedUnavailable, with_retries
 
 logger = logging.getLogger("apex.feed.twelve")
@@ -116,7 +115,8 @@ class TwelveDataFeed(DataFeed):
         if not candles:
             raise FeedError("TwelveData returned no candles")
         candles.sort(key=lambda c: c.timestamp)
-        return candles
+        cutoff = utcnow() - timedelta(seconds=TIMEFRAME_SECONDS[timeframe])
+        return [bar for bar in candles if bar.timestamp <= cutoff]
 
     async def fetch_price(self, instrument: str) -> tuple[float, float]:
         payload = await self._get("/price", {"symbol": to_twelve_symbol(instrument)})
@@ -124,7 +124,7 @@ class TwelveDataFeed(DataFeed):
             price = float(payload["price"])
         except (KeyError, TypeError, ValueError) as exc:
             raise FeedError(f"Malformed TwelveData quote: {payload}") from exc
-        # TwelveData quotes are mid prices; assume a typical 20 pip gold spread.
+        # TwelveData quotes are mid prices; assume a typical 2 pip gold spread (not an executable quote).
         half = 0.10
         return round(price - half, 2), round(price + half, 2)
 

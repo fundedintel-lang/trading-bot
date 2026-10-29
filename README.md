@@ -1,6 +1,6 @@
 # APEX-SMC — XAU/USD Institutional Algo Trading Engine
 
-Production-grade **Smart Money Concepts (SMC) / ICT** trading engine for XAU/USD.
+Paper-first **Smart Money Concepts (SMC) / ICT** research and trading engine for XAU/USD.
 Async-native Python 3.11+, externalised configuration, structured JSON logging,
 hard risk limits, OANDA v20 execution (plus a deterministic paper broker),
 backtesting, walk-forward analysis and a Streamlit dashboard.
@@ -10,6 +10,15 @@ backtesting, walk-forward analysis and a Streamlit dashboard.
 > live execution disabled behind three independent interlocks. Backtest output —
 > especially on synthetic data — is a plumbing check, **not** a profitability
 > claim.
+
+### Execution and AI safety upgrade
+
+See **[docs/UPGRADE.md](docs/UPGRADE.md)** for optional Groq **or** xAI/Grok
+review, secure environment-key setup, stricter risk/approval guards and corrected
+backtesting. Rotate any key shared in chat; no disclosed credential is stored in
+this repository. AI is off by default and can never override risk limits.
+Historical synthetic results below/linked elsewhere predate the replay fix and
+are **not** current performance evidence. Profitability is unproven.
 
 ---
 
@@ -128,7 +137,8 @@ data refresh ─▶ hard gates (session, weekend, breaker, news)
              ─▶ 15M structure ─▶ OB / FVG / sweep ─▶ zone selection
              ─▶ 10-factor confluence (≥7) ─▶ PendingSetup armed
              ─▶ per 5M bar: 7-check trigger (≥6, checks 1 & 7 mandatory)
-             ─▶ validator (16 checks) ─▶ risk engine ─▶ broker
+             ─▶ validator ─▶ optional advisory/veto AI review
+             ─▶ fresh quote + final risk/approval checks ─▶ broker
 ```
 
 Every stage writes a structured log line, and every rejection carries a reason
@@ -191,9 +201,17 @@ APEX_EXECUTION_MODE=SEMI_AUTO     # overrides bot.execution_mode
 APEX_ALLOW_LIVE=false             # extra interlock for a live account
 ```
 
-Live trading requires **all three**: `execution.broker: oanda`,
-`execution.allow_live_trading: true`, and an `OANDA_ACCESS_TOKEN` pointing at a
-live host. Anything else stays on paper.
+Live OANDA requires `execution.broker: oanda`, `oanda_environment: live`,
+`execution.allow_live_trading: true`, **and** independently
+`APEX_ALLOW_LIVE=true`, with valid account credentials. The YAML and environment
+switches cannot enable one another. Selecting OANDA with missing credentials
+fails closed rather than silently switching to paper. Synthetic fallback is
+allowed only with the paper broker.
+
+Optional AI credentials: `GROQ_API_KEY` for Groq, **or** `XAI_API_KEY` for
+xAI/Grok; these are different services. Set `APEX_AI_ENABLED=true`, the correct
+`APEX_AI_PROVIDER` and `APEX_AI_MODEL` in `.env` to enable review. Start with
+`APEX_AI_MODE=advisory` in paper mode. [Full setup and limitations](docs/UPGRADE.md).
 
 ---
 
@@ -222,7 +240,10 @@ risk vetoes behave exactly as they do live. The feed is cursor-based: no bar
 after the cycle timestamp is ever visible.
 
 * reports are written to `reports/backtest_*.json`
-* fewer than 20 trades is flagged as statistically meaningless
+* fewer than 20 trades is flagged as below the reporting threshold, not statistical proof
+* replay uses closed HTF bars and conservative OHLC stop-first execution, with spread, slippage and configurable per-side commissions
+* AI and the current news calendar are always disabled in historical replay
+* confidence intervals and explicit assumptions are included; runtime errors invalidate the run
 * `--research` relaxes the confluence/5M gates; it is for synthetic-data
   studies only and is never a default
 
@@ -265,51 +286,27 @@ structured JSON and human-readable text to console, log, SQLite, Telegram and
 
 ---
 
-## 9. Measured behaviour (synthetic data)
+## 9. Evaluation, not profitability claims
 
-Reproducible reference runs — 90 days of deterministic synthetic gold, ending
-2026-10-07 14:00 UTC. Full measurements: [docs/FREQUENCY.md](docs/FREQUENCY.md).
+The previous synthetic measurements are preserved in
+[docs/FREQUENCY.md](docs/FREQUENCY.md) as **legacy** records. They predate the
+closed-HTF replay fix, cost corrections and production-cadence replay; do not
+compare them with current output or use them as evidence of a trading edge.
 
 ```bash
-python main.py backtest --days 90 --seed 11 --end 2026-10-07T14:00Z
-python main.py --config configs/high_frequency.yaml backtest --days 90 --seed 11 --end 2026-10-07T14:00Z
+python main.py backtest --days 90 --seed 11 --end 2026-10-28T16:00Z
+python main.py --config configs/high_frequency.yaml backtest --days 90 --seed 11 --end 2026-10-28T16:00Z
 ```
 
-| Profile | Trades | Trades/day | Win rate | Payoff | Profit factor | Net P/L | Max DD |
-|---|---|---|---|---|---|---|---|
-| Conservative (`config.yaml`) | 15 | 0.17 | 26.7 % | 1.64:1 | 0.60 | −$259.26 | 4.52 % |
-| High frequency (`configs/high_frequency.yaml`, 4 × 0.5 %) | 91 | **1.01** | 33.0 % | 1.99:1 | 0.98 | −$36.24 | 5.37 % |
+These commands use **generated prices**, not market gold. They test execution
+and throughput, not whether the strategy can make money. The high-frequency
+preset relaxes selectivity; more trades are not an upgrade to expectancy.
+Neither the strategy nor the optional AI reviewer has an established live edge.
 
-Both runs are far below the 20-trade statistical minimum for the conservative
-profile, the data is synthetic (regime-switching noise, not gold), and neither
-result says anything reliable about profitability. What they *do* demonstrate is
-throughput and cost discipline: the high-frequency profile puts ~1 order a day
-into the market without breaking a single hard law (max 2 % exposure, 5 % daily
-halt, news blackout, spread cap) and lands within 1 % of break-even **after**
-paying the spread on every trade.
-
-The exit engine is the reason the payoff column is no longer ~1:1: TP1 is
-floored at 1.5R, the stop only moves after TP2
-(`risk.breakeven_after_tp1: false`) and the time stop only closes positions that
-are not working (`risk.time_exit_only_losers: true`). See
-[docs/FREQUENCY.md](docs/FREQUENCY.md) §3 for the full before/after.
-
-### Trade frequency is a knob, not a bug
-
-The v1.0 build produced 5 trades in 90 days because five separate defects were
-stacked on top of each other; each is now fixed **and** configurable:
-
-| Defect | Fix | Key |
-|---|---|---|
-| Sweeps only on 5-pip "equal" clusters ($0.50 on gold — almost never forms) | single swing highs/lows are raidable pools too | `strategy.single_swing_lookback_bars` |
-| `HTF_NOT_ALIGNED` demanded 4H *and* 1H agreement — stricter than the law | trade with the 4H during a 1H pullback (`4H_PULLBACK`), and from the correct range half when the 4H ranges (`RANGE`) | `strategy.allow_1h_pullback_alignment`, `strategy.allow_range_alignment` |
-| Entries rested as limits at the zone edge; ~70 % never filled | `entry_mode: MARKET` fills at the 5M trigger, TP1 floored at `min_rr_tp1` | `strategy.entry_mode` |
-| `risk.max_position_age_hours` was never enforced — one position could hold a slot for two days | `TIME_EXIT` time stop implemented | `risk.max_position_age_hours` |
-| Arming required price to already be at the zone | arming radius separated from the trigger radius | `strategy.arm_entry_distance_pips` |
-
-**Do not tune thresholds to manufacture trades on synthetic noise.** Run the
-same commands with `--csv your_xauusd_m5.csv` and 2+ years of real candles
-before drawing any conclusion, and require ≥100 trades per profile.
+For evaluation, supply real M5 candles from your intended broker with `--csv`,
+set realistic spread/slippage/commission costs, retain enough history for HTF
+warmup, and use fixed out-of-sample walk-forward windows. Follow with a
+prospective paper/practice test. [Assumptions and verification](docs/UPGRADE.md).
 
 ## 10. Status & known limitations
 
@@ -319,16 +316,23 @@ before drawing any conclusion, and require ≥100 trades per profile.
 * Trade frequency is configurable, not fixed. The conservative profile can
   legitimately produce zero trades in a three-day paper session — that is
   selectivity, not a stalled engine. `configs/high_frequency.yaml` raises the
-  cadence to ~1.7 trades/day at half size per trade. `python main.py status` and
+  cadence with smaller trades; there is no fixed trades/day promise. `python main.py status` and
   the dashboard's Risk tab show the live rejection counters, so you can always
   see which gate is binding.
-* Frequency is not the same thing as edge. The high-frequency profile produces
-  13× more trades than the conservative one on the same 90-day sample and still
-  does not demonstrate a positive expectancy. Validate on real data first.
+* Frequency is not the same thing as edge. The high-frequency profile does not
+  establish a positive expectancy. Validate on real data first.
 
-* The economic-calendar fetch needs outbound network; when it is unavailable the
-  filter fails **open** by design (`news.fail_closed: false`) and logs the
-  condition. Set `fail_closed: true` to refuse all entries without a calendar.
+* The economic-calendar fetch needs outbound network; the default now fails
+  **closed** (`news.fail_closed: true`) and refuses new entries without a usable
+  calendar. Offline `demo` / `selftest` disable the calendar explicitly.
+* AI is an optional second opinion, not a price feed, autonomous trader, or
+  guarantee. Historical backtests do not validate its live effect. See the
+  dashboard's AI Review tab and [AI setup](docs/UPGRADE.md).
+* Approvals and the paper broker's cash/positions are in-memory. Restarting does
+  not restore them. Use Telegram approvals in the running engine; a fresh CLI
+  process cannot recover another process's approval queue.
+* The simulator excludes financing/margin liquidation and tick-level queue
+  effects. OANDA needs practice-account verification; use a dedicated USD account.
 * MetaTrader 5 is optional and Windows-only; the feed degrades gracefully.
 * Gold CFDs have no central exchange — broker feed differences (spread, gaps)
   matter more than any parameter in this repository.

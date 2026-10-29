@@ -8,6 +8,7 @@ the network, so the metrics are trivially testable.
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Sequence
@@ -87,9 +88,8 @@ def max_drawdown(equity_curve: Sequence[float]) -> tuple[float, float]:
     for value in equity_curve:
         peak = max(peak, value)
         drop = peak - value
-        if drop > worst_abs:
-            worst_abs = drop
-            worst_pct = (drop / peak * 100.0) if peak > 0 else 0.0
+        worst_abs = max(worst_abs, drop)
+        worst_pct = max(worst_pct, (drop / peak * 100.0) if peak > 0 else 0.0)
     return round(worst_abs, 2), round(worst_pct, 2)
 
 
@@ -169,6 +169,27 @@ def daily_returns(trades: Iterable[Any], starting_equity: float) -> list[float]:
     return returns
 
 
+def win_rate_interval(wins: int, total: int) -> list[float]:
+    """95% Wilson interval in percent (not a forecast of future win rate)."""
+    if total <= 0:
+        return [0.0, 100.0]
+    z = 1.959963984540054
+    p = wins / total
+    denominator = 1 + z * z / total
+    center = (p + z * z / (2 * total)) / denominator
+    width = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / denominator
+    return [round(max(0.0, center - width) * 100, 2), round(min(1.0, center + width) * 100, 2)]
+
+
+def expectancy_interval(pnls: Sequence[float], seed: int = 7, samples: int = 1000) -> list[float]:
+    """Seeded IID bootstrap, exploratory only; correlated trades violate IID."""
+    if len(pnls) < 2:
+        return []
+    rng = random.Random(seed)
+    means = sorted(sum(rng.choices(pnls, k=len(pnls))) / len(pnls) for _ in range(samples))
+    return [round(means[int(samples * 0.025)], 2), round(means[min(samples - 1, int(samples * 0.975))], 2)]
+
+
 # --------------------------------------------------------------------------- report
 @dataclass
 class PerformanceReport:
@@ -201,6 +222,9 @@ class PerformanceReport:
     days_traded: int = 0
     equity_curve: list[float] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    win_rate_ci_95: list[float] = field(default_factory=list)
+    expectancy_ci_95: list[float] = field(default_factory=list)
+    evidence: str = "insufficient_sample"
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -225,6 +249,8 @@ class PerformanceReport:
             f"Net P/L           : ${self.net_profit:+,.2f} ({self.return_percent:+.2f}%)",
             f"Equity            : ${self.initial_equity:,.2f} → ${self.final_equity:,.2f}",
             f"Expectancy        : ${self.expectancy:+,.2f}/trade",
+            f"Expectancy 95% CI : {self.expectancy_ci_95} USD (IID bootstrap)",
+            f"Evidence          : {self.evidence} (in-sample, not a forecast)",
             f"Average win/loss  : ${self.average_win:+,.2f} / ${self.average_loss:+,.2f}",
             f"Largest win/loss  : ${self.largest_win:+,.2f} / ${self.largest_loss:+,.2f}",
             f"Max drawdown      : ${self.max_drawdown:,.2f} ({self.max_drawdown_percent:.2f}%)",
@@ -246,6 +272,8 @@ def build_report(
     """Compute the complete metric set from closed trades."""
 
     pnls = [_pnl(trade) for trade in trades]
+    if any(not math.isfinite(pnl) for pnl in pnls):
+        raise ValueError("Trade P/L must be finite")
     curve = list(equity_curve) if equity_curve else [initial_equity]
     if not equity_curve and pnls:
         equity = initial_equity
@@ -264,13 +292,25 @@ def build_report(
     if len(pnls) < min_trades_for_report:
         notes.append(
             f"NOTE: only {len(pnls)} trades — below the {min_trades_for_report}-trade "
-            "statistical minimum. Treat these figures as indicative only."
+            "minimum reporting sample, not statistical proof. Treat these figures as indicative only."
         )
     if not pnls:
         notes.append("NOTE: no completed trades in this window.")
+    interval = expectancy_interval(pnls)
+    evidence = "insufficient_sample"
+    if len(pnls) >= max(2, min_trades_for_report):
+        evidence = ("positive_in_sample" if interval[0] > 0 else
+                    "negative_in_sample" if interval[1] < 0 else "inconclusive")
+    notes.append("Confidence intervals assume independent trades; they do not establish a live edge or account for strategy selection bias.")
+    notes.append("Sharpe/Sortino use days with realized closes, not a complete daily mark-to-market NAV series.")
+    if abs(final_equity - initial_equity - sum(pnls)) > 0.02:
+        notes.append("WARNING: equity does not reconcile with closed-trade P/L (open positions or accounting mismatch).")
 
     return PerformanceReport(
         trades=len(pnls),
+        win_rate_ci_95=win_rate_interval(len(wins), len(pnls)),
+        expectancy_ci_95=interval,
+        evidence=evidence,
         wins=len(wins),
         losses=len(losses),
         win_rate=win_rate(pnls),

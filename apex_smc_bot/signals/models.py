@@ -124,6 +124,7 @@ class PositionSizing:
     lot_size: float
     units: float
     contract_size: float = 100.0
+    cost_reserve_pips: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -132,6 +133,7 @@ class PositionSizing:
             "risk_amount_usd": round(self.risk_amount_usd, 2),
             "sl_pips": round(self.sl_pips, 1),
             "pip_value_per_lot": self.pip_value_per_lot,
+            "cost_reserve_pips": round(self.cost_reserve_pips, 2),
             "lot_size": round(self.lot_size, 2),
             "units": round(self.units, 2),
             "notional_oz": round(self.lot_size * self.contract_size, 2),

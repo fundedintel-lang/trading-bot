@@ -19,13 +19,15 @@ import asyncio
 import json
 import logging
 import time
+import math
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 from apex_smc_bot.backtesting.performance_metrics import PerformanceReport, build_report
-from apex_smc_bot.config import Settings
+from apex_smc_bot.config import Secrets, Settings
 from apex_smc_bot.core.engine import TradingEngine
 from apex_smc_bot.data.candle_manager import Candle, to_utc, utcnow
 from apex_smc_bot.data.database import Database
@@ -46,6 +48,7 @@ class BacktestConfig:
     initial_equity: float = 10_000.0
     spread_pips: float = 2.0
     slippage_pips: float = 0.5
+    commission_per_lot: float = 0.0  # per side
     risk_percent: float = 1.0
     seed: int = 42
     data_csv: str | None = None
@@ -53,6 +56,17 @@ class BacktestConfig:
     start: datetime | None = None
     end: datetime | None = None
     research_mode: bool = False
+
+    def validate(self) -> None:
+        if self.days < 1 or self.initial_equity <= 0 or not 0 < self.risk_percent <= 2:
+            raise ValueError("Backtest days/equity must be positive and risk within (0, 2]")
+        costs = (self.spread_pips, self.slippage_pips, self.commission_per_lot)
+        if any(not math.isfinite(value) or value < 0 for value in costs) or not math.isfinite(self.initial_equity):
+            raise ValueError("Backtest equity/costs must be finite; costs cannot be negative")
+        if self.data_csv and self.research_mode:
+            raise ValueError("--research is for synthetic data only, not real-data evaluation")
+        if self.start is not None and self.end is not None and to_utc(self.start) >= to_utc(self.end):
+            raise ValueError("Backtest start must precede end")
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "BacktestConfig":
@@ -62,6 +76,7 @@ class BacktestConfig:
             initial_equity=cfg.initial_equity,
             spread_pips=cfg.spread_pips,
             slippage_pips=cfg.slippage_pips,
+            commission_per_lot=cfg.commission_per_lot,
             risk_percent=cfg.risk_percent,
             seed=cfg.seed,
             data_csv=cfg.data_csv,
@@ -80,14 +95,18 @@ class BacktestResult:
     counters: dict[str, Any] = field(default_factory=dict)
     start: datetime | None = None
     end: datetime | None = None
+    cycle_errors: int = 0
+    assumptions: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
-        return self.report.trades > 0
+        return self.cycle_errors == 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "config": self.config.__dict__,
+            "assumptions": self.assumptions,
+            "cycle_errors": self.cycle_errors,
             "report": self.report.to_dict(),
             "trades": self.trades,
             "signals": self.signals,
@@ -130,7 +149,8 @@ def load_dataset(config: BacktestConfig) -> dict[str, list[Candle]]:
 
         return {"M5": m5, "M15": resample(m5, "M15"), "H1": resample(m5, "H1"), "H4": resample(m5, "H4")}
     end = config.end or utcnow()
-    return generate_market_data(days=config.days, seed=config.seed, end=end)
+    # Warmup is history only, never scored/traded. H4 bias needs more than a few days.
+    return generate_market_data(days=config.days + 90, seed=config.seed, end=end)
 
 
 class BacktestEngine:
@@ -141,10 +161,12 @@ class BacktestEngine:
         settings: Settings,
         config: BacktestConfig | None = None,
         database: Database | None = None,
+        dataset: dict[str, list[Candle]] | None = None,
     ) -> None:
         self.settings = settings
         self.config = config or BacktestConfig.from_settings(settings)
         self.database = database
+        self.dataset = dataset
 
     def _settings_for_run(self) -> Settings:
         """Apply backtest overrides to a copy of the settings."""
@@ -162,6 +184,7 @@ class BacktestEngine:
                 self.settings.risk.max_risk_per_trade_percent, self.config.risk_percent
             ),
             starting_equity=self.config.initial_equity,
+            reduced_risk_percent=min(self.settings.risk.reduced_risk_percent, self.config.risk_percent / 2),
             min_equity=0.0,
         )
         strategy = self.settings.strategy
@@ -176,6 +199,11 @@ class BacktestEngine:
         return replace(
             self.settings,
             notifications=notifications,
+            bot=replace(self.settings.bot, execution_mode="FULL_AUTO"),
+            execution=replace(self.settings.execution, broker="paper", oanda_environment="practice",
+                              allow_live_trading=False, paper_auto_approve=True),
+            ai=replace(self.settings.ai, enabled=False),  # never leak future model knowledge into history
+            secrets=Secrets(), live_trading_confirmed=False,
             risk=risk,
             strategy=strategy,
             news=replace(self.settings.news, enabled=False),
@@ -183,11 +211,14 @@ class BacktestEngine:
         )
 
     async def run(self, progress: Callable[[int, int], None] | None = None) -> BacktestResult:
+        self.config.validate()
         settings = self._settings_for_run()
-        data = load_dataset(self.config)
+        data = self.dataset if self.dataset is not None else load_dataset(self.config)
         m5 = data["M5"]
         if not m5:
             raise ValueError("Backtest dataset is empty")
+        if any(a.timestamp >= b.timestamp for a, b in zip(m5, m5[1:])):
+            raise ValueError("Backtest M5 data must be strictly chronological and unique")
 
         feed = ReplayFeed(data, spread_price=self.config.spread_pips * settings.risk.pip_size)
         broker = PaperBroker(
@@ -195,6 +226,7 @@ class BacktestEngine:
             database=None,
             slippage_price=self.config.slippage_pips * settings.risk.pip_size,
             contract_size=settings.risk.contract_size,
+            commission_per_lot=self.config.commission_per_lot,
         )
         database = self.database
         if database is None:
@@ -210,28 +242,31 @@ class BacktestEngine:
             notifier=Notifier(settings, database=database, logging_bundle=bundle, banner=False),
         )
 
-        await engine.start()
-        start_index = 0
-        if self.config.start is not None:
-            start_index = feed.seek(self.config.start)
-        elif len(m5) > 60 * 24 * self.config.days:
-            start_index = len(m5) - 60 * 24 * self.config.days
-        end_index = len(m5) - 1
-        if self.config.end is not None:
-            end_index = feed.seek(self.config.end)
-
+        # Explicit, non-overlapping window semantics: bars open at/after start
+        # and CLOSE at/before end. Warmup history remains available to indicators.
+        times = [bar.timestamp for bar in m5]
+        window_end = to_utc(self.config.end) if self.config.end else m5[-1].timestamp + timedelta(minutes=5)
+        window_start = to_utc(self.config.start) if self.config.start else window_end - timedelta(days=self.config.days)
+        start_index = bisect_left(times, window_start)
+        end_index = bisect_right(times, window_end - timedelta(minutes=5)) - 1
+        if start_index > end_index or start_index >= len(m5) or end_index < 0:
+            await engine.shutdown("empty_backtest_window")
+            raise ValueError("No completed M5 bars in the requested backtest window")
         feed.cursor = start_index
+        await engine.start()
         started = time.perf_counter()
         cycles = 0
+        cycle_errors = 0
         signals: list[dict[str, Any]] = []
         equity_curve: list[float] = [self.config.initial_equity]
         try:
             for index in range(start_index, end_index + 1):
                 feed.cursor = index
                 now = m5[index].timestamp + timedelta(minutes=5)
-                report = await engine.cycle(now=now, force=True)
+                report = await engine.cycle(now=now)  # same 5M / 15M cadence as production
                 cycles += 1
                 if report.errors:
+                    cycle_errors += 1
                     logger.warning("Cycle %d errors: %s", cycles, report.errors)
                 equity_curve.append(broker.equity(m5[index].close))
                 if progress is not None and cycles % 500 == 0:
@@ -256,6 +291,14 @@ class BacktestEngine:
             initial_equity=self.config.initial_equity,
             min_trades_for_report=self.config.min_trades_for_report,
         )
+        report_metrics.notes.extend([
+            "DATA: " + ("historical CSV; verify broker/quality" if self.config.data_csv else
+                        "SYNTHETIC simulation, NOT evidence of profitability"),
+            "ASSUMPTIONS: OHLC stop-first on ambiguous bars; spread + entry/exit slippage + per-side commission; no swap/financing.",
+            "AI and news calendar disabled in replay; historical results do not validate those live overlays.",
+        ])
+        if cycle_errors:
+            report_metrics.notes.append(f"INVALID RUN: {cycle_errors} cycle(s) had runtime errors.")
         return BacktestResult(
             config=self.config,
             report=report_metrics,
@@ -265,7 +308,14 @@ class BacktestEngine:
             duration_seconds=duration,
             counters=engine.state.counters.to_dict(),
             start=m5[start_index].timestamp,
-            end=m5[end_index].timestamp,
+            end=m5[end_index].timestamp + timedelta(minutes=5),
+            cycle_errors=cycle_errors,
+            assumptions={"data_source": "csv" if self.config.data_csv else "synthetic",
+                         "ai_enabled": False, "news_enabled": False,
+                         "intrabar_policy": "stop_first; new limit fills cannot claim earlier intrabar targets",
+                         "spread_pips": self.config.spread_pips, "slippage_pips_per_side": self.config.slippage_pips,
+                         "commission_per_lot_per_side": self.config.commission_per_lot,
+                         "financing_included": False, "research_mode": self.config.research_mode},
         )
 
     def run_sync(self, progress: Callable[[int, int], None] | None = None) -> BacktestResult:
@@ -285,7 +335,7 @@ def run_backtest_cli(
     """``python main.py backtest`` implementation."""
 
     config = BacktestConfig.from_settings(settings)
-    if days:
+    if days is not None:
         config.days = days
     if csv:
         config.data_csv = csv
@@ -336,4 +386,4 @@ def run_backtest_cli(
         print(f"\nReport written to {out_path}", flush=True)
     except OSError as exc:
         print(f"Could not write report: {exc}", flush=True)
-    return 0
+    return 0 if result.ok else 1

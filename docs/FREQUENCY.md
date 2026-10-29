@@ -1,3 +1,8 @@
+> **LEGACY MEASUREMENTS — NOT CURRENT PERFORMANCE.** These numbers predate the
+> corrected closed-HTF replay, cost accounting and production-cadence replay.
+> They may contain look-ahead effects and must not be treated as evidence of
+> profitability or compared with new runs. See [UPGRADE.md](UPGRADE.md).
+
 # Trade frequency: what actually limits it, and what to do about it
 
 This document records every measurement behind the frequency work, so the

@@ -9,13 +9,12 @@ Gold convention used everywhere in this repo:
 
 Sizing always **floors** to the broker lot step so the realised risk cannot
 exceed the configured percentage.  If even the minimum lot would breach the risk
-budget by more than ``risk_tolerance`` the trade is rejected (lots = 0).
+budget the trade is rejected (lots = 0). Costs may be reserved in the stop distance.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Any
 
 from apex_smc_bot.analysis.structure import BEARISH, BULLISH
@@ -46,10 +45,15 @@ def calculate_position_size(
     min_lot: float = 0.01,
     max_lot: float = 10.0,
     lot_step: float = 0.01,
-    risk_tolerance: float = 1.10,
+    risk_tolerance: float = 1.0,
 ) -> float:
     """Return lot size (floor-rounded) or ``0.0`` when the trade is unsizeable."""
 
+    values = (account_equity, risk_percent, sl_pips, pip_value_per_lot, min_lot, max_lot, lot_step, risk_tolerance)
+    if any(isinstance(value, bool) or not math.isfinite(value) for value in values):
+        raise LotSizeError("Sizing inputs must be finite numbers")
+    if not 0 < risk_tolerance <= 1:
+        raise LotSizeError("risk_tolerance cannot permit exceeding the risk budget")
     if account_equity <= 0:
         raise LotSizeError("account_equity must be positive")
     if not 0 < risk_percent <= 100:
@@ -66,16 +70,15 @@ def calculate_position_size(
     if raw_lots <= 0 or not math.isfinite(raw_lots):
         return 0.0
 
-    steps = math.floor(raw_lots / lot_step + 1e-9)
-    lot_size = round(steps * lot_step, 2)
-    lot_size = min(lot_size, max_lot)
+    steps = math.floor(min(raw_lots, max_lot) / lot_step + 1e-9)
+    lot_size = round(steps * lot_step, 8)
     if lot_size < min_lot:
-        # Minimum lot would exceed the budget by too much -> reject.
+        # Never round UP into risk the account cannot afford.
         min_risk = min_lot * sl_pips * pip_value_per_lot
         if min_risk > risk_amount * risk_tolerance:
             return 0.0
         lot_size = min_lot
-    return round(lot_size, 2)
+    return lot_size
 
 
 def calculate_position(
@@ -85,9 +88,14 @@ def calculate_position(
     stop_loss: float,
     config: RiskConfig,
     direction: str = BULLISH,
+    cost_reserve_pips: float = 0.0,
 ) -> PositionSizing:
     """Build a :class:`PositionSizing` with validation of stop direction."""
 
+    if direction not in {BULLISH, BEARISH}:
+        raise LotSizeError("Unknown trade direction")
+    if not math.isfinite(cost_reserve_pips) or cost_reserve_pips < 0:
+        raise LotSizeError("Cost reserve must be finite and non-negative")
     if direction == BULLISH and stop_loss >= entry_price:
         raise LotSizeError(f"Long stop {stop_loss} must be below entry {entry_price}")
     if direction == BEARISH and stop_loss <= entry_price:
@@ -96,7 +104,7 @@ def calculate_position(
     lot_size = calculate_position_size(
         account_equity,
         risk_percent,
-        pips,
+        pips + cost_reserve_pips,
         config.pip_value_per_lot,
         config.min_lot,
         config.max_lot,
@@ -110,12 +118,13 @@ def calculate_position(
     return PositionSizing(
         account_equity=account_equity,
         risk_percent=risk_percent,
-        risk_amount_usd=risk_amount,
+        risk_amount_usd=round(lot_size * (pips + cost_reserve_pips) * config.pip_value_per_lot, 4),
         sl_pips=pips,
         pip_value_per_lot=config.pip_value_per_lot,
         lot_size=lot_size,
         units=round(lot_size * config.contract_size, 2),
         contract_size=config.contract_size,
+        cost_reserve_pips=cost_reserve_pips,
     )
 
 

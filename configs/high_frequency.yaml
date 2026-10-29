@@ -1,5 +1,7 @@
 # =============================================================================
 # APEX-SMC — HIGH-FREQUENCY INTRADAY PRESET
+# Research preset, NOT a profitability recommendation. Sample-specific comments
+# below predate corrected replay; see docs/UPGRADE.md before evaluating it.
 # =============================================================================
 # Use this preset when the goal is trade *flow* (multiple trades per session)
 # rather than the conservative A+ swing profile in config.yaml.

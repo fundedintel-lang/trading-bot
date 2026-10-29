@@ -19,8 +19,7 @@ venv/
 apex_state.sqlite3
 
 # Logs / artifacts
-logs/*.log
-logs/*.log.*
+logs/
 reports/
 artifacts/
 .coverage
